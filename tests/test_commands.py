@@ -7,7 +7,16 @@ import pytest
 from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.cli.commands import _make_provider, app
+from nanobot.cli.commands import (
+    _make_primary_provider,
+    _make_provider,
+    _make_router_provider,
+    _make_secondary_provider,
+    _make_vl_provider,
+    _routing_section,
+    _routing_value,
+    app,
+)
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -326,6 +335,228 @@ def test_make_provider_passes_extra_headers_to_custom_provider():
     assert kwargs["base_url"] == "https://example.com/v1"
     assert kwargs["default_headers"]["APP-Code"] == "demo-app"
     assert kwargs["default_headers"]["x-session-affinity"] == "sticky-session"
+
+
+def test_make_provider_supports_custom_router_endpoint():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"provider": "custom", "model": "router-model"}},
+            "providers": {
+                "customRouter": {
+                    "apiKey": "router-key",
+                    "apiBase": "https://router.example/v1",
+                    "extraHeaders": {"x-router": "1"},
+                }
+            },
+        }
+    )
+
+    with patch("nanobot.providers.custom_provider.AsyncOpenAI") as mock_async_openai:
+        _make_provider(config, forced_provider="custom_router")
+
+    kwargs = mock_async_openai.call_args.kwargs
+    assert kwargs["api_key"] == "router-key"
+    assert kwargs["base_url"] == "https://router.example/v1"
+    assert kwargs["default_headers"]["x-router"] == "1"
+
+
+def test_make_provider_supports_custom_vl_endpoint():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"provider": "custom", "model": "vl-model"}},
+            "providers": {
+                "customVl": {
+                    "apiKey": "vl-key",
+                    "apiBase": "https://vl.example/v1",
+                    "extraHeaders": {"x-vl": "yes"},
+                }
+            },
+        }
+    )
+
+    with patch("nanobot.providers.custom_provider.AsyncOpenAI") as mock_async_openai:
+        _make_provider(config, forced_provider="custom_vl")
+
+    kwargs = mock_async_openai.call_args.kwargs
+    assert kwargs["api_key"] == "vl-key"
+    assert kwargs["base_url"] == "https://vl.example/v1"
+    assert kwargs["default_headers"]["x-vl"] == "yes"
+
+
+def test_make_router_provider_prefers_custom_router_when_configured():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "base-model"}},
+            "providers": {
+                "customRouter": {
+                    "apiKey": "router-key",
+                    "apiBase": "https://router.example/v1",
+                }
+            },
+        }
+    )
+
+    sentinel = object()
+    with patch("nanobot.cli.commands._make_provider", return_value=sentinel) as mock_make:
+        provider = _make_router_provider(config)
+
+    assert provider is sentinel
+    mock_make.assert_called_once_with(
+        config,
+        model=config.agents.defaults.model,
+        forced_provider="custom_router",
+    )
+
+
+def test_make_secondary_provider_falls_back_to_primary_when_not_configured():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "base-model", "provider": "custom"}},
+        }
+    )
+
+    sentinel = object()
+    with patch("nanobot.cli.commands._make_primary_provider", return_value=sentinel) as mock_primary:
+        provider = _make_secondary_provider(config)
+
+    assert provider is sentinel
+    mock_primary.assert_called_once_with(config)
+
+
+def test_make_vl_provider_uses_custom_vl_when_configured():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "base-model", "visionModel": "vision-model"}},
+            "providers": {
+                "customVl": {
+                    "apiKey": "vl-key",
+                    "apiBase": "https://vl.example/v1",
+                }
+            },
+        }
+    )
+
+    sentinel = object()
+    with patch("nanobot.cli.commands._make_provider", return_value=sentinel) as mock_make:
+        provider = _make_vl_provider(config)
+
+    assert provider is sentinel
+    mock_make.assert_called_once_with(
+        config,
+        model=config.get_vision_model(),
+        forced_provider="custom_vl",
+    )
+
+
+def test_routing_section_reads_top_level_routing_config():
+    config = Config.model_validate(
+        {
+            "routing": {
+                "primaryShare": 0.72,
+                "visionProvider": "openai",
+                "secondaryModel": "gemini/gemini-2.5-pro",
+            }
+        }
+    )
+
+    section = _routing_section(config)
+
+    assert section["primary_share"] == pytest.approx(0.72)
+    assert section["vision_provider"] == "openai"
+    assert section["secondary_model"] == "gemini/gemini-2.5-pro"
+
+
+def test_routing_value_supports_snake_and_camel_with_default():
+    config = Config.model_validate(
+        {
+            "routing": {
+                "forcePrimaryPatterns": ["always-normal"],
+                "promptOverride": "use this",
+            }
+        }
+    )
+
+    assert _routing_value(config, "force_primary_patterns") == ["always-normal"]
+    assert _routing_value(config, "prompt_override") == "use this"
+    assert _routing_value(config, "missing_key", default="fallback") == "fallback"
+
+
+def test_make_primary_provider_supports_any_provider_override_from_routing():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "base-model", "provider": "custom"}},
+            "routing": {
+                "primaryProvider": "openai",
+                "primaryModel": "gpt-4o-mini",
+            },
+            "providers": {
+                "openai": {"apiKey": "sk-openai"},
+            },
+        }
+    )
+
+    sentinel = object()
+    with patch("nanobot.cli.commands._make_provider", return_value=sentinel) as mock_make:
+        provider = _make_primary_provider(config)
+
+    assert provider is sentinel
+    mock_make.assert_called_once_with(
+        config,
+        model="gpt-4o-mini",
+        forced_provider="openai",
+    )
+
+
+def test_make_secondary_provider_supports_non_custom_provider_override_from_routing():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "base-model", "provider": "custom"}},
+            "routing": {
+                "secondaryProvider": "gemini",
+                "secondaryModel": "gemini/gemini-2.5-pro",
+            },
+            "providers": {
+                "gemini": {"apiKey": "gemini-key"},
+            },
+        }
+    )
+
+    sentinel = object()
+    with patch("nanobot.cli.commands._make_provider", return_value=sentinel) as mock_make:
+        provider = _make_secondary_provider(config)
+
+    assert provider is sentinel
+    mock_make.assert_called_once_with(
+        config,
+        model="gemini/gemini-2.5-pro",
+        forced_provider="gemini",
+    )
+
+
+def test_make_vl_provider_supports_any_provider_override_from_routing():
+    config = Config.model_validate(
+        {
+            "agents": {"defaults": {"model": "base-model", "visionModel": "vision-model"}},
+            "routing": {
+                "visionProvider": "openai",
+                "visionModel": "gpt-4.1-mini",
+            },
+            "providers": {
+                "openai": {"apiKey": "sk-openai"},
+            },
+        }
+    )
+
+    sentinel = object()
+    with patch("nanobot.cli.commands._make_provider", return_value=sentinel) as mock_make:
+        provider = _make_vl_provider(config)
+
+    assert provider is sentinel
+    mock_make.assert_called_once_with(
+        config,
+        model="gpt-4.1-mini",
+        forced_provider="openai",
+    )
 
 
 @pytest.fixture

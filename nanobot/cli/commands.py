@@ -422,11 +422,21 @@ def _make_provider(
     provider_name = config.get_provider_name(model, forced_provider=forced_provider)
     p = config.get_provider(model, forced_provider=forced_provider)
 
+    # Harden provider resolution: fail fast with a clear message when
+    # auto-detection cannot map the current model/provider configuration.
+    if provider_name is None:
+        selected_provider = forced_provider or config.agents.defaults.provider
+        console.print("[red]Error: Unable to resolve provider for the configured model.[/red]")
+        console.print(f"Model: {model}")
+        console.print(f"Provider setting: {selected_provider}")
+        console.print("Set a valid provider explicitly or configure matching provider API credentials.")
+        raise typer.Exit(1)
+
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         provider = OpenAICodexProvider(default_model=model)
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    elif provider_name in {"custom", "custom_vision"}:
+    elif provider_name in {"custom", "custom_router", "custom_vision", "custom_vl"}:
         from nanobot.providers.custom_provider import CustomProvider
         provider = CustomProvider(
             api_key=p.api_key if p else "no-key",
@@ -483,6 +493,174 @@ def _make_vision_provider(config: Config):
         model=config.get_vision_model(),
         forced_provider=vision_provider,
     )
+
+
+def _snake_to_camel(name: str) -> str:
+    """Convert snake_case to camelCase."""
+    head, *tail = name.split("_")
+    return head + "".join(part.capitalize() for part in tail)
+
+
+def _routing_section(config: Config) -> dict[str, Any]:
+    """Return top-level routing config as a plain dict when available."""
+    routing = getattr(config, "routing", None)
+    if routing is None:
+        # Backward compatibility: support legacy nested routing location.
+        routing = getattr(getattr(config.agents, "defaults", None), "routing", None)
+    if routing is None:
+        return {}
+    if isinstance(routing, dict):
+        return routing
+    if hasattr(routing, "model_dump"):
+        try:
+            return routing.model_dump(mode="python", by_alias=False, exclude_none=True)
+        except Exception:
+            return {}
+    return {}
+
+
+def _routing_value(config: Config, *keys: str, default: Any = None) -> Any:
+    """Get a routing value by snake_case/camelCase key with fallback default."""
+    routing = _routing_section(config)
+    for key in keys:
+        if key in routing and routing[key] is not None:
+            return routing[key]
+        camel = _snake_to_camel(key)
+        if camel in routing and routing[camel] is not None:
+            return routing[camel]
+    return default
+
+
+def _make_primary_provider(config: Config):
+    """Create the primary/default route provider, with optional routing overrides."""
+    primary_model = _routing_value(
+        config,
+        "primary_model",
+        default=config.agents.defaults.model,
+    )
+    primary_provider = _routing_value(
+        config,
+        "primary_provider",
+        default=config.agents.defaults.provider,
+    )
+
+    forced_provider = None if primary_provider in (None, "", "auto") else str(primary_provider)
+    return _make_provider(
+        config,
+        model=primary_model or config.agents.defaults.model,
+        forced_provider=forced_provider,
+    )
+
+
+def _make_router_provider(config: Config):
+    """Create the tiny router provider/model for request classification."""
+    router_model = _routing_value(
+        config,
+        "router_model",
+        "reasoning_router_model",
+        default=config.get_reasoning_router_model(),
+    )
+    router_provider = _routing_value(
+        config,
+        "router_provider",
+        "reasoning_router_provider",
+        default=config.agents.defaults.reasoning_router_provider,
+    )
+
+    # Explicit router config always wins.
+    if router_provider or router_model:
+        forced_provider = None if router_provider in (None, "", "auto") else str(router_provider)
+        return _make_provider(
+            config,
+            model=router_model or config.agents.defaults.model,
+            forced_provider=forced_provider,
+        )
+
+    # If a dedicated custom router endpoint is configured, use it by default.
+    router_cfg = config.providers.custom_router
+    has_custom_router = bool(router_cfg.api_key or router_cfg.api_base or router_cfg.extra_headers)
+    if has_custom_router:
+        return _make_provider(
+            config,
+            model=config.agents.defaults.model,
+            forced_provider="custom_router",
+        )
+
+    # Fallback to the configured primary route provider/model.
+    return _make_primary_provider(config)
+
+
+def _make_secondary_provider(config: Config):
+    """Create the optional secondary-route provider/model."""
+    secondary_model = _routing_value(
+        config,
+        "secondary_model",
+        "reasoning_model",
+        "reasoning_fallback_model",
+        default=config.get_reasoning_fallback_model(),
+    )
+    secondary_provider = _routing_value(
+        config,
+        "secondary_provider",
+        "reasoning_provider",
+        "reasoning_fallback_provider",
+        default=config.agents.defaults.reasoning_fallback_provider,
+    )
+
+    # Secondary route is strictly optional:
+    # only use a dedicated secondary route when explicitly configured.
+    if secondary_provider or secondary_model:
+        forced_provider = None if secondary_provider in (None, "", "auto") else str(secondary_provider)
+        return _make_provider(
+            config,
+            model=secondary_model or config.agents.defaults.model,
+            forced_provider=forced_provider,
+        )
+
+    # No explicit fallback configured -> keep normal/default provider behavior.
+    return _make_primary_provider(config)
+
+
+def _make_vl_provider(config: Config):
+    """Create the dedicated vision-route provider (legacy name kept for compatibility)."""
+    vision_model = _routing_value(
+        config,
+        "vision_model",
+        "vl_model",
+        default=config.get_vision_model(),
+    )
+    vision_provider = _routing_value(
+        config,
+        "vision_provider",
+        "vl_provider",
+        default=config.agents.defaults.vision_provider,
+    )
+
+    if vision_provider:
+        forced_provider = None if vision_provider in (None, "", "auto") else str(vision_provider)
+        return _make_provider(
+            config,
+            model=vision_model or config.get_vision_model(),
+            forced_provider=forced_provider,
+        )
+
+    vl_cfg = config.providers.custom_vl
+    has_custom_vl = bool(vl_cfg.api_key or vl_cfg.api_base or vl_cfg.extra_headers)
+    if has_custom_vl:
+        return _make_provider(
+            config,
+            model=vision_model or config.get_vision_model(),
+            forced_provider="custom_vl",
+        )
+
+    if vision_model and vision_model != config.get_vision_model():
+        return _make_provider(
+            config,
+            model=vision_model,
+            forced_provider=config.agents.defaults.vision_provider,
+        )
+
+    return _make_vision_provider(config)
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -555,8 +733,11 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(runtime_config)
+    provider = _make_primary_provider(runtime_config)
     vision_provider = _make_vision_provider(runtime_config)
+    router_provider = _make_router_provider(runtime_config)
+    secondary_provider = _make_secondary_provider(runtime_config)
+    vision_route_provider = _make_vl_provider(runtime_config)
     session_manager = SessionManager(runtime_config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
@@ -568,9 +749,16 @@ def gateway(
         bus=bus,
         provider=provider,
         vision_provider=vision_provider,
+        router_provider=router_provider,
+        reasoning_provider=secondary_provider,
+        vl_provider=vision_route_provider,
         workspace=runtime_config.workspace_path,
-        model=runtime_config.agents.defaults.model,
+        model=provider.get_default_model(),
         vision_model=runtime_config.get_vision_model(),
+        router_model=router_provider.get_default_model(),
+        reasoning_model=secondary_provider.get_default_model(),
+        vl_model=vision_route_provider.get_default_model(),
+        routing_config=runtime_config.routing,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
         context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
         web_search_config=runtime_config.tools.web.search,
@@ -749,8 +937,11 @@ def agent(
     sync_workspace_templates(runtime_config.workspace_path)
 
     bus = MessageBus()
-    provider = _make_provider(runtime_config)
+    provider = _make_primary_provider(runtime_config)
     vision_provider = _make_vision_provider(runtime_config)
+    router_provider = _make_router_provider(runtime_config)
+    secondary_provider = _make_secondary_provider(runtime_config)
+    vision_route_provider = _make_vl_provider(runtime_config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_cron_dir() / "jobs.json"
@@ -765,9 +956,16 @@ def agent(
         bus=bus,
         provider=provider,
         vision_provider=vision_provider,
+        router_provider=router_provider,
+        reasoning_provider=secondary_provider,
+        vl_provider=vision_route_provider,
         workspace=runtime_config.workspace_path,
-        model=runtime_config.agents.defaults.model,
+        model=provider.get_default_model(),
         vision_model=runtime_config.get_vision_model(),
+        router_model=router_provider.get_default_model(),
+        reasoning_model=secondary_provider.get_default_model(),
+        vl_model=vision_route_provider.get_default_model(),
+        routing_config=runtime_config.routing,
         max_iterations=runtime_config.agents.defaults.max_tool_iterations,
         context_window_tokens=runtime_config.agents.defaults.context_window_tokens,
         web_search_config=runtime_config.tools.web.search,

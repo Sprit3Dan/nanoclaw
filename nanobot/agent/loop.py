@@ -10,7 +10,7 @@ import sys
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
 
 from loguru import logger
 
@@ -33,7 +33,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RoutingConfig, WebSearchConfig
     from nanobot.cron.service import CronService
 
 
@@ -50,6 +50,21 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _ROUTER_MAX_USER_CHARS = 2_000
+    _DEFAULT_VL_KEYWORDS = (
+        "analyze this image",
+        "analyze this picture",
+        "analyze this screenshot",
+        "describe this image",
+        "describe this picture",
+        "what do you see in this image",
+        "what is in this image",
+        "read text from this image",
+        "extract text from this image",
+        "ocr this image",
+        "analyze this chart image",
+        "analyze this diagram image",
+    )
 
     def __init__(
         self,
@@ -69,6 +84,13 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         vision_provider: LLMProvider | None = None,
         vision_model: str | None = None,
+        router_provider: LLMProvider | None = None,
+        router_model: str | None = None,
+        reasoning_provider: LLMProvider | None = None,
+        reasoning_model: str | None = None,
+        vl_provider: LLMProvider | None = None,
+        vl_model: str | None = None,
+        routing_config: RoutingConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -88,6 +110,13 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self.vision_provider = vision_provider or provider
         self.vision_model = vision_model or self.model
+        self.router_provider = router_provider or provider
+        self.router_model = router_model or self.model
+        self.reasoning_provider = reasoning_provider or provider
+        self.reasoning_model = reasoning_model or self.model
+        self.vl_provider = vl_provider or self.vision_provider
+        self.vl_model = vl_model or self.vision_model
+        self.routing_config = routing_config
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -223,11 +252,13 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
 
+        active_provider, active_model, route_label = await self._select_provider_for_request(messages)
+        logger.info("Request route selected: {}", route_label)
+
         while iteration < self.max_iterations:
             iteration += 1
 
             tool_defs = self.tools.get_definitions()
-            active_provider, active_model = self._select_provider_for_messages(messages)
 
             response = await active_provider.chat_with_retry(
                 messages=messages,
@@ -290,19 +321,361 @@ class AgentLoop:
             )
         return final_content, tools_used, messages
 
-    def _select_provider_for_messages(
+    @staticmethod
+    def _flatten_content_to_text(content: Any) -> str:
+        """Flatten message content (string/list blocks) into plain text."""
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        chunks: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                chunks.append(block["text"])
+        return "\n".join(chunks).strip()
+
+    @staticmethod
+    def _message_contains_image(message: dict[str, Any]) -> bool:
+        """Return True when a message contains an image block."""
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                return True
+        return False
+
+    def _extract_latest_user_text(self, messages: list[dict[str, Any]]) -> str:
+        """Get the latest user message as plain text."""
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            return self._flatten_content_to_text(message.get("content"))
+        return ""
+
+    def _routing_field_provided(self, *field_names: str) -> bool:
+        """Return True if any routing config field is explicitly provided."""
+        cfg = self.routing_config
+        if cfg is None:
+            return False
+        return any(bool(getattr(cfg, name, None)) for name in field_names)
+
+    def _routing_router_enabled(self) -> bool:
+        """Router is active when any router config field is provided."""
+        return self._routing_field_provided(
+            "router_provider", "router_model",
+            "reasoning_router_provider", "reasoning_router_model",
+        )
+
+    def _routing_vision_enabled(self) -> bool:
+        """Vision route is active when vision fields or force patterns are provided."""
+        return self._routing_field_provided(
+            "vision_provider", "vision_model",
+            "vl_provider", "vl_model",
+        ) or bool(self._routing_patterns("force_vision_patterns"))
+
+    def _routing_secondary_enabled(self) -> bool:
+        """Secondary route is active when secondary fields or force patterns are provided."""
+        return self._routing_field_provided(
+            "secondary_provider", "secondary_model",
+            "reasoning_provider", "reasoning_model",
+            "reasoning_fallback_provider", "reasoning_fallback_model",
+        ) or bool(self._routing_patterns("force_secondary_patterns"))
+
+    def _routing_primary_share(self) -> float:
+        cfg = self.routing_config
+        if cfg is None:
+            val = 0.85
+        elif hasattr(cfg, "primary_share"):
+            val = getattr(cfg, "primary_share")
+        else:
+            val = getattr(cfg, "custom_share", 0.85)
+        try:
+            f = float(val)
+        except Exception:
+            return 0.85
+        return max(0.0, min(1.0, f))
+
+    def _routing_patterns(self, attr: str) -> list[str]:
+        cfg = self.routing_config
+        if cfg is None:
+            return []
+
+        legacy_aliases: dict[str, tuple[str, ...]] = {
+            "force_primary_patterns": ("force_primary_patterns", "force_custom_patterns"),
+            "force_vision_patterns": ("force_vision_patterns", "force_vl_patterns"),
+            "force_secondary_patterns": ("force_secondary_patterns", "force_reasoning_patterns"),
+        }
+        lookup_attrs = legacy_aliases.get(attr, (attr,))
+        raw: list[str] | Any = []
+        for key in lookup_attrs:
+            value = getattr(cfg, key, None)
+            if isinstance(value, list):
+                raw = value
+                break
+
+        if not isinstance(raw, list):
+            return []
+        return [p.lower().strip() for p in raw if isinstance(p, str) and p.strip()]
+
+    @staticmethod
+    def _matches_pattern(text: str, patterns: list[str]) -> bool:
+        return any(p in text for p in patterns)
+
+    def _routing_prompt(self) -> str:
+        cfg = self.routing_config
+        override = getattr(cfg, "prompt_override", None) if cfg is not None else None
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+
+        primary_desc = "default choice, questions, tool calls, low level effort reasoning"
+        vision_desc = "describe images, OCR, screenshots, diagrams, and other visual understanding tasks"
+        secondary_desc = "hardcore reasoning, deep problem solving, and complex multi-step technical analysis"
+
+        route_descriptions = getattr(cfg, "route_descriptions", None) if cfg is not None else None
+        if isinstance(route_descriptions, dict):
+            primary_desc = route_descriptions.get("primary") or route_descriptions.get("custom") or primary_desc
+            vision_desc = (
+                route_descriptions.get("vision")
+                or route_descriptions.get("vl")
+                or route_descriptions.get("custom_vl")
+                or vision_desc
+            )
+            secondary_desc = (
+                route_descriptions.get("secondary")
+                or route_descriptions.get("reasoning")
+                or secondary_desc
+            )
+        elif route_descriptions is not None:
+            primary_desc = (
+                getattr(route_descriptions, "primary", None)
+                or getattr(route_descriptions, "custom", None)
+                or primary_desc
+            )
+            vision_desc = (
+                getattr(route_descriptions, "vision", None)
+                or getattr(route_descriptions, "vl", None)
+                or getattr(route_descriptions, "custom_vl", None)
+                or vision_desc
+            )
+            secondary_desc = (
+                getattr(route_descriptions, "secondary", None)
+                or getattr(route_descriptions, "reasoning", None)
+                or secondary_desc
+            )
+
+        primary_pct = int(round(self._routing_primary_share() * 100))
+        secondary_note = (
+            f"- Route to reasoning for: {secondary_desc}.\n"
+            if self._routing_secondary_enabled()
+            else "- secondary route is disabled by policy; do not output reasoning.\n"
+        )
+        vision_note = (
+            f"- Route to custom_vl for: {vision_desc}.\n"
+            if self._routing_vision_enabled()
+            else "- vision route is disabled by policy; do not output custom_vl.\n"
+        )
+        return (
+            "You are a routing classifier for an AI assistant.\n"
+            "Output exactly one label: custom, custom_vl, or reasoning.\n"
+            f"- Route to custom for: {primary_desc}. This should be the dominant route (~{primary_pct}%).\n"
+            f"{vision_note}"
+            f"{secondary_note}"
+            "Do not explain. Return one label only."
+        )
+
+    def _routing_examples(self) -> list[tuple[str, str]]:
+        cfg = self.routing_config
+        raw = getattr(cfg, "examples", []) if cfg is not None else []
+        if not isinstance(raw, list):
+            return []
+        result: list[tuple[str, str]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                user_in = item.get("input")
+                route = item.get("route")
+            else:
+                user_in = getattr(item, "input", None)
+                route = getattr(item, "route", None)
+            if not isinstance(user_in, str) or not user_in.strip():
+                continue
+            if route not in ("custom", "custom_vl", "reasoning"):
+                continue
+            result.append((user_in.strip(), route))
+        return result
+
+    def _looks_like_vl_request(self, messages: list[dict[str, Any]]) -> bool:
+        """Detect likely vision-language requests via image blocks or text cues."""
+        if any(self._message_contains_image(m) for m in messages):
+            return True
+
+        text = self._extract_latest_user_text(messages).lower().strip()
+        if not text:
+            return False
+
+        force_vision = self._routing_patterns("force_vision_patterns")
+        if self._matches_pattern(text, force_vision):
+            return True
+
+        if any(kw in text for kw in self._DEFAULT_VL_KEYWORDS):
+            return True
+
+        non_vl_image_contexts = (
+            "docker image",
+            "container image",
+            "image build",
+            "image pull",
+            "image tag",
+            "vm image",
+            "disk image",
+            "iso image",
+            "firmware image",
+        )
+        if any(ctx in text for ctx in non_vl_image_contexts):
+            return False
+
+        visual_intents = (
+            "analyze",
+            "describe",
+            "identify",
+            "detect",
+            "read text",
+            "extract text",
+            "what do you see",
+            "what is in",
+            "look at",
+        )
+        visual_artifacts = (
+            "image",
+            "photo",
+            "picture",
+            "screenshot",
+            "diagram",
+            "chart",
+            "graph",
+            "scan",
+        )
+        return any(v in text for v in visual_intents) and any(a in text for a in visual_artifacts)
+
+    @staticmethod
+    def _is_route_available(provider: LLMProvider | None, model: str | None) -> bool:
+        """Return True when a provider/model pair is usable for routing."""
+        if provider is None:
+            return False
+        if model:
+            return True
+        try:
+            return bool(provider.get_default_model())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_router_route(content: str | None) -> Literal["custom", "custom_vl", "reasoning"]:
+        """Parse route label from router LLM output."""
+        text = (content or "").strip().lower()
+        if "custom_vl" in text or "customvl" in text:
+            return "custom_vl"
+        if "reasoning" in text or "fallback" in text or "sota" in text:
+            return "reasoning"
+        return "custom"
+
+    async def _route_with_router_llm(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[LLMProvider, str]:
-        """Choose the vision provider/model when image content is present."""
-        for message in messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "image_url":
-                    return self.vision_provider, self.vision_model
-        return self.provider, self.model
+    ) -> Literal["custom", "custom_vl", "reasoning"]:
+        """Use a tiny router model to classify the request path."""
+        if not self._routing_router_enabled():
+            return "custom"
+
+        user_text = self._extract_latest_user_text(messages)
+        if len(user_text) > self._ROUTER_MAX_USER_CHARS:
+            user_text = user_text[:self._ROUTER_MAX_USER_CHARS]
+
+        router_messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._routing_prompt()},
+        ]
+        for ex_input, ex_route in self._routing_examples():
+            router_messages.append({"role": "user", "content": ex_input})
+            router_messages.append({"role": "assistant", "content": ex_route})
+        router_messages.append({"role": "user", "content": user_text or "(empty user request)"})
+
+        response = await self.router_provider.chat_with_retry(
+            messages=router_messages,
+            model=self.router_model,
+            max_tokens=8,
+            temperature=0.0,
+        )
+        route = self._parse_router_route(response.content)
+
+        if route == "custom_vl" and not self._routing_vision_enabled():
+            return "custom"
+        if route == "reasoning" and not self._routing_secondary_enabled():
+            return "custom"
+        return route
+
+    async def _select_provider_for_request(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[LLMProvider, str, Literal["custom", "custom_vl", "reasoning"]]:
+        """Route a request to custom / custom_vl / reasoning provider+model."""
+        default_provider, default_model = self.provider, self.model
+        user_text = self._extract_latest_user_text(messages).lower().strip()
+
+        force_primary = self._routing_patterns("force_primary_patterns")
+        force_vision = self._routing_patterns("force_vision_patterns")
+        force_secondary = self._routing_patterns("force_secondary_patterns")
+
+        # Explicit pattern overrides (highest priority).
+        if user_text and self._matches_pattern(user_text, force_primary):
+            return default_provider, default_model, "custom"
+        if user_text and self._matches_pattern(user_text, force_vision):
+            if self._routing_vision_enabled() and self._is_route_available(self.vl_provider, self.vl_model):
+                return self.vl_provider, self.vl_model, "custom_vl"
+            return default_provider, default_model, "custom"
+        if user_text and self._matches_pattern(user_text, force_secondary):
+            if self._routing_secondary_enabled() and self._is_route_available(self.reasoning_provider, self.reasoning_model):
+                return self.reasoning_provider, self.reasoning_model, "reasoning"
+            return default_provider, default_model, "custom"
+
+        # Router is optional: if router fields were not provided, keep primary route.
+        if not self._routing_router_enabled():
+            return default_provider, default_model, "custom"
+
+        # Hard gate: image inputs prefer vision route when allowed and available.
+        if any(self._message_contains_image(m) for m in messages):
+            if self._routing_vision_enabled() and self._is_route_available(self.vl_provider, self.vl_model):
+                return self.vl_provider, self.vl_model, "custom_vl"
+            return default_provider, default_model, "custom"
+
+        # Lightweight vision heuristic before router call.
+        if self._routing_vision_enabled() and self._looks_like_vl_request(messages):
+            if self._is_route_available(self.vl_provider, self.vl_model):
+                return self.vl_provider, self.vl_model, "custom_vl"
+            return default_provider, default_model, "custom"
+
+        if (not self._routing_router_enabled()) or (not self._is_route_available(self.router_provider, self.router_model)):
+            return default_provider, default_model, "custom"
+
+        route: Literal["custom", "custom_vl", "reasoning"] = "custom"
+        try:
+            route = await self._route_with_router_llm(messages)
+        except Exception as e:
+            logger.warning("Router model failed, defaulting to custom route: {}", e)
+            return default_provider, default_model, "custom"
+
+        if route == "custom_vl":
+            if self._routing_vision_enabled() and self._is_route_available(self.vl_provider, self.vl_model):
+                return self.vl_provider, self.vl_model, route
+            return default_provider, default_model, "custom"
+
+        if route == "reasoning":
+            if self._routing_secondary_enabled() and self._is_route_available(self.reasoning_provider, self.reasoning_model):
+                return self.reasoning_provider, self.reasoning_model, route
+            return default_provider, default_model, "custom"
+
+        return default_provider, default_model, "custom"
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""

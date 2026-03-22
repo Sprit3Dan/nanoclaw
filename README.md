@@ -908,6 +908,166 @@ Connects directly to any OpenAI-compatible endpoint — LM Studio, llama.cpp, To
 </details>
 
 <details>
+<summary><b>Three-way Request Routing (primary / vision / secondary)</b></summary>
+
+nanobot can route each request to one of three paths:
+
+- `primary` (default path): low-effort thinking and general Q&A. This should handle most requests (~85%).
+- `vision`: vision-language requests (images, OCR, charts, screenshots, visual grounding).
+- `secondary` (optional): hard multi-step reasoning/problem-solving requests, only used when explicitly configured.
+
+Legacy route labels are still accepted and used internally:
+- `custom` ≈ `primary`
+- `custom_vl` ≈ `vision`
+- `reasoning` ≈ `secondary`
+
+How routing is chosen:
+
+1. Policy + overrides from top-level `routing` config are applied first.
+2. Image inputs are hard-routed to `vision` when vision route fields are provided.
+3. A tiny router model classifies remaining requests into `primary`, `vision`, or `secondary`.
+4. If a selected route is unavailable, nanobot safely falls back to `primary`.
+
+(Internally and for backward compatibility, the labels `custom`, `custom_vl`, and `reasoning` still work.)
+
+### Top-level routing config (`routing`)
+
+Merge this section into `~/.nanobot/config.json`:
+
+```json
+{
+  "routing": {
+    "primaryShare": 0.85,
+
+    "primaryProvider": "auto",
+    "primaryModel": null,
+
+    "routerProvider": null,
+    "routerModel": null,
+
+    "visionProvider": null,
+    "visionModel": null,
+
+    "secondaryProvider": null,
+    "secondaryModel": null,
+
+    "routeDescriptions": {
+      "primary": "default choice, questions, tool calls, low level effort reasoning",
+      "vision": "describe images, OCR, screenshots, diagrams, and visual tasks",
+      "secondary": "hardcore reasoning and deep multi-step problem solving"
+    },
+
+    "promptOverride": null,
+    "forcePrimaryPatterns": [],
+    "forceVisionPatterns": [],
+    "forceSecondaryPatterns": [],
+    "examples": []
+  }
+}
+```
+
+Key meanings:
+
+- `primaryShare`: target bias for `primary` in the router prompt (for example `0.85`).
+
+Per-route provider/model overrides (can point to any configured provider):
+- `primaryProvider` / `primaryModel`: default route backend for `primary`.
+- `routerProvider` / `routerModel`: tiny routing classifier backend.
+- `visionProvider` / `visionModel`: backend for `vision`.
+- `secondaryProvider` / `secondaryModel`: backend for `secondary`.
+
+Implicit activation (no boolean toggles):
+- Router path is active when `routerProvider` or `routerModel` is provided.
+- Vision path is active when `visionProvider`/`visionModel` is provided, or `forceVisionPatterns` is set.
+- Secondary path is active when `secondaryProvider`/`secondaryModel` is provided, or `forceSecondaryPatterns` is set.
+
+Explicit router backend guidance:
+- Set both `routerProvider` and `routerModel` to explicitly choose which model does routing classification.
+- If router fields are omitted, routing classification stays on the primary path.
+
+Prompt steering:
+- `routeDescriptions`: structured route intent text used to construct the router prompt (`primary`, `vision`, `secondary`).
+- `promptOverride`: full router system prompt (takes precedence over `routeDescriptions`).
+- `forcePrimaryPatterns` / `forceVisionPatterns` / `forceSecondaryPatterns`: substring rules applied before router LLM call.
+
+Legacy aliases remain supported:
+- `customShare` → `primaryShare`
+- `vlProvider` / `vlModel` → `visionProvider` / `visionModel`
+- `reasoningProvider` / `reasoningModel` → `secondaryProvider` / `secondaryModel`
+- `forceCustomPatterns` / `forceVlPatterns` / `forceReasoningPatterns` → `forcePrimaryPatterns` / `forceVisionPatterns` / `forceSecondaryPatterns`
+- `routeDescriptions.custom` / `routeDescriptions.vl` / `routeDescriptions.reasoning` → `routeDescriptions.primary` / `routeDescriptions.vision` / `routeDescriptions.secondary`
+- `examples`: optional few-shot examples for router steering, each item:
+
+```json
+{
+  "input": "Please OCR this screenshot",
+  "route": "custom_vl"
+}
+```
+
+`route` values currently use legacy labels for compatibility: `custom`, `custom_vl`, `reasoning`
+(`primary`, `vision`, `secondary` terminology maps to those labels).
+
+### Provider/model wiring for each route
+
+You can still use these existing keys as defaults/fallbacks:
+
+- `agents.defaults.provider`
+- `agents.defaults.model`
+- `agents.defaults.visionProvider`
+- `agents.defaults.visionModel`
+- `agents.defaults.reasoningRouterModel`
+- `agents.defaults.reasoningRouterProvider`
+- `agents.defaults.reasoningFallbackModel`
+- `agents.defaults.reasoningFallbackProvider`
+
+And you may use dedicated custom endpoints if desired:
+
+- `providers.custom` (optional default endpoint)
+- `providers.customRouter` (optional dedicated tiny router endpoint)
+- `providers.customVl` (optional dedicated VL endpoint)
+
+Practical setup guidance:
+
+- You can route each path to any provider (OpenAI, Anthropic, Gemini, OpenRouter, custom, etc.) via `routing.*Provider` + `routing.*Model`.
+- If you prefer a single backend for most traffic, set `routing.primaryProvider`/`routing.primaryModel`.
+- If you have a cheap classifier endpoint, set `routing.routerProvider`/`routing.routerModel`.
+- If you have a strong multimodal endpoint, set `routing.visionProvider`/`routing.visionModel`.
+- `secondary` route is optional. If `routing.secondaryProvider`/`routing.secondaryModel` are not set, hard requests fall back to the primary/default route.
+
+Concrete `custom` + `custom_vl` setup example:
+
+```json
+{
+  "providers": {
+    "custom": {
+      "apiKey": "no-key",
+      "apiBase": "http://nemotron-30b-predictor.inference.svc.cluster.local/v1"
+    },
+    "customVl": {
+      "apiKey": "no-key",
+      "apiBase": "http://qwen25-vl-7b-predictor.inference.svc.cluster.local/v1"
+    }
+  },
+  "routing": {
+    "primaryShare": 0.85,
+    "primaryProvider": "custom",
+    "primaryModel": "nemotron-30b",
+    "visionProvider": "custom_vl",
+    "visionModel": "qwen25-vl-7b"
+  }
+}
+```
+
+Example decisions:
+
+- “Summarize this article” → `primary` (`custom`)
+- “What does this screenshot say?” → `vision` (`custom_vl`)
+- “Design and prove a complex algorithmic approach” → `secondary` (`reasoning`) (only when `routing.secondaryProvider`/`routing.secondaryModel` is configured, otherwise it falls back)
+
+</details>
+
+<details>
 <summary><b>Ollama (local)</b></summary>
 
 Run a local model with Ollama, then add to config:

@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -34,8 +34,12 @@ class AgentDefaults(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
-    vision_model: str | None = None
-    vision_provider: str | None = None
+    vision_model: str | None = None  # Dedicated model for image inputs (defaults to `model`)
+    vision_provider: str | None = None  # Dedicated provider for `vision_model`
+    reasoning_router_model: str | None = None  # Tiny classifier model that routes: custom / custom_vl / reasoning
+    reasoning_router_provider: str | None = None  # Provider for `reasoning_router_model` (often custom/custom_router)
+    reasoning_fallback_model: str | None = None  # SOTA reasoning model for hard tasks (e.g. Anthropic/OpenAI/Gemini)
+    reasoning_fallback_provider: str | None = None  # Provider for `reasoning_fallback_model`
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
     temperature: float = 0.1
@@ -47,6 +51,92 @@ class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+
+
+class RoutingExample(Base):
+    """One optional routing example for few-shot steering."""
+
+    input: str = ""
+    route: Literal["custom", "custom_vl", "reasoning"] = "custom"
+
+
+class RouteDescriptions(Base):
+    """Human-readable routing criteria used to construct the router prompt."""
+
+    primary: str = Field(
+        default="default choice, questions, tool calls, low level effort reasoning",
+        validation_alias=AliasChoices("primary", "custom"),
+    )
+    vision: str = Field(
+        default="describe images, OCR, screenshots, diagrams, and other visual understanding tasks",
+        validation_alias=AliasChoices("vision", "vl", "custom_vl"),
+    )
+    secondary: str = Field(
+        default="hardcore reasoning, deep problem solving, and complex multi-step technical analysis",
+        validation_alias=AliasChoices("secondary", "reasoning"),
+    )
+
+
+class RoutingConfig(Base):
+    """Request-routing policy configuration."""
+
+    # Naming normalized to primary / secondary / vision.
+    # Backward compatible aliases:
+    # - custom_* -> primary_*
+    # - reasoning_* -> secondary_*
+    # - vl_* -> vision_*
+    primary_share: float = Field(
+        default=0.85,
+        validation_alias=AliasChoices("primary_share", "primaryShare", "custom_share", "customShare"),
+    )
+
+    # Optional per-route provider/model overrides.
+    # If unset, nanobot uses existing defaults from `agents.defaults` and provider auto-matching.
+    primary_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("primary_provider", "primaryProvider", "custom_provider", "customProvider"),
+    )
+    primary_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("primary_model", "primaryModel", "custom_model", "customModel"),
+    )
+    vision_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("vision_provider", "visionProvider", "vl_provider", "vlProvider"),
+    )
+    vision_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("vision_model", "visionModel", "vl_model", "vlModel"),
+    )
+    secondary_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("secondary_provider", "secondaryProvider", "reasoning_provider", "reasoningProvider"),
+    )
+    secondary_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("secondary_model", "secondaryModel", "reasoning_model", "reasoningModel"),
+    )
+    router_provider: str | None = None
+    router_model: str | None = None
+    route_descriptions: RouteDescriptions = Field(
+        default_factory=RouteDescriptions,
+        validation_alias=AliasChoices("route_descriptions", "routeDescriptions"),
+    )
+
+    prompt_override: str | None = None  # Full router system prompt override
+    force_primary_patterns: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("force_primary_patterns", "forcePrimaryPatterns", "force_custom_patterns", "forceCustomPatterns"),
+    )
+    force_vision_patterns: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("force_vision_patterns", "forceVisionPatterns", "force_vl_patterns", "forceVlPatterns"),
+    )
+    force_secondary_patterns: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("force_secondary_patterns", "forceSecondaryPatterns", "force_reasoning_patterns", "forceReasoningPatterns"),
+    )
+    examples: list[RoutingExample] = Field(default_factory=list)
 
 
 class ProviderConfig(Base):
@@ -61,7 +151,9 @@ class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
+    custom_router: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible endpoint for reasoning routing
     custom_vision: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible vision endpoint
+    custom_vl: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible vision-language endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -151,6 +243,7 @@ class Config(BaseSettings):
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
@@ -302,5 +395,29 @@ class Config(BaseSettings):
             self.get_vision_model(),
             forced_provider=self.agents.defaults.vision_provider,
         )
+
+    def get_reasoning_router_model(self) -> str | None:
+        """Get the configured routing model for complexity classification."""
+        return self.agents.defaults.reasoning_router_model
+
+    def get_reasoning_router_provider_name(self) -> str | None:
+        """Get the registry name of the configured reasoning router provider."""
+        model = self.get_reasoning_router_model()
+        forced = self.agents.defaults.reasoning_router_provider
+        if not model and not forced:
+            return None
+        return self.get_provider_name(model, forced_provider=forced)
+
+    def get_reasoning_fallback_model(self) -> str | None:
+        """Get the configured fallback model for hard coding/reasoning tasks."""
+        return self.agents.defaults.reasoning_fallback_model
+
+    def get_reasoning_fallback_provider_name(self) -> str | None:
+        """Get the registry name of the configured reasoning fallback provider."""
+        model = self.get_reasoning_fallback_model()
+        forced = self.agents.defaults.reasoning_fallback_provider
+        if not model and not forced:
+            return None
+        return self.get_provider_name(model, forced_provider=forced)
 
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
