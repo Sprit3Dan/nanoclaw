@@ -466,7 +466,7 @@ def _make_provider(
             raise typer.Exit(1)
         provider = LiteLLMProvider(
             api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
+            api_base=config.get_api_base(model, forced_provider=forced_provider),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
             provider_name=provider_name,
