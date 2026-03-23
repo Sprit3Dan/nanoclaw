@@ -300,31 +300,36 @@ class MemoryConsolidator:
         return True
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
-        """Loop: archive old messages until prompt fits within half the context window."""
+        """Loop: archive old messages until prompt fits within input budget."""
         if not session.messages or self.context_window_tokens <= 0:
             return
 
         lock = self.get_lock(session.key)
         async with lock:
-            target = self.context_window_tokens // 2
+            generation = getattr(self.provider, "generation", None)
+            reserved_output = int(getattr(generation, "max_tokens", 0) or 0)
+            reserved_output = max(1, reserved_output)
+            input_budget = max(1, self.context_window_tokens - reserved_output)
+
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
-            if estimated < self.context_window_tokens:
+            if estimated <= input_budget:
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
+                    "Token consolidation idle {}: {}/{} input-budget (reserved output {}) via {}",
                     session.key,
                     estimated,
-                    self.context_window_tokens,
+                    input_budget,
+                    reserved_output,
                     source,
                 )
                 return
 
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
+                if estimated <= input_budget:
                     return
 
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
+                boundary = self.pick_consolidation_boundary(session, max(1, estimated - input_budget))
                 if boundary is None:
                     logger.debug(
                         "Token consolidation: no safe boundary for {} (round {})",
