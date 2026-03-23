@@ -721,6 +721,9 @@ class AgentLoop:
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
+            if self._last_usage:
+                session.metadata["last_prompt_tokens"] = int(self._last_usage.get("prompt_tokens", 0) or 0)
+                session.metadata["last_completion_tokens"] = int(self._last_usage.get("completion_tokens", 0) or 0)
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -793,6 +796,9 @@ class AgentLoop:
             final_content = "I've completed processing but have no response to give."
 
         self._save_turn(session, all_msgs, 1 + len(history))
+        if self._last_usage:
+            session.metadata["last_prompt_tokens"] = int(self._last_usage.get("prompt_tokens", 0) or 0)
+            session.metadata["last_completion_tokens"] = int(self._last_usage.get("completion_tokens", 0) or 0)
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
@@ -858,8 +864,14 @@ class AgentLoop:
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
-            if role == "assistant" and not content and not entry.get("tool_calls"):
-                continue  # skip empty assistant messages — they poison session context
+            if role == "assistant":
+                if not content and not entry.get("tool_calls"):
+                    continue  # skip empty assistant messages — they poison session context
+                if self._last_usage:
+                    entry["usage"] = {
+                        "prompt_tokens": int(self._last_usage.get("prompt_tokens", 0) or 0),
+                        "completion_tokens": int(self._last_usage.get("completion_tokens", 0) or 0),
+                    }
             if role == "tool":
                 if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                     entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"

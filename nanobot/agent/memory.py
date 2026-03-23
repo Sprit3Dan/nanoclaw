@@ -290,6 +290,24 @@ class MemoryConsolidator:
             self._get_tool_definitions(),
         )
 
+    def observed_prompt_tokens(self, session: Session) -> tuple[int, str]:
+        """Return latest observed prompt tokens from runtime metadata/history when available."""
+        meta = getattr(session, "metadata", {}) or {}
+        for key in ("last_prompt_tokens", "prompt_tokens", "observed_prompt_tokens"):
+            val = meta.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                return int(val), f"session_metadata:{key}"
+
+        for message in reversed(session.messages):
+            usage = message.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            prompt_tokens = usage.get("prompt_tokens")
+            if isinstance(prompt_tokens, (int, float)) and prompt_tokens > 0:
+                return int(prompt_tokens), "message_usage"
+
+        return 0, "none"
+
     async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
         """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
         if not messages:
@@ -311,7 +329,9 @@ class MemoryConsolidator:
             reserved_output = max(1, reserved_output)
             input_budget = max(1, self.context_window_tokens - reserved_output)
 
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            estimated, source = self.observed_prompt_tokens(session)
+            if estimated <= 0:
+                estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
             if estimated <= input_budget:

@@ -48,6 +48,8 @@ class CustomProvider(LLMProvider):
             kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
+        if kwargs.get("stream"):
+            kwargs["stream_options"] = {"include_usage": True}
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
