@@ -819,9 +819,26 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        response_metadata = dict(msg.metadata or {})
+        if msg.channel == "a2a":
+            raw_a2a = response_metadata.get("_a2a")
+            a2a_ctx = raw_a2a if isinstance(raw_a2a, dict) else {}
+            origin_agent = str(a2a_ctx.get("from_agent") or msg.sender_id).strip() or str(msg.sender_id)
+            reply_to_base = a2a_ctx.get("reply_to_base")
+            if isinstance(reply_to_base, str) and reply_to_base.strip():
+                response_metadata["a2a_peer_base"] = reply_to_base.strip()
+
+            return OutboundMessage(
+                channel="a2a",
+                chat_id=origin_agent,
+                content=final_content,
+                metadata=response_metadata,
+            )
+
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=response_metadata,
         )
 
     @staticmethod
