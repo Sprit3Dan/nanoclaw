@@ -297,6 +297,10 @@ class MemoryConsolidator:
             val = meta.get(key)
             if isinstance(val, (int, float)) and val > 0:
                 return int(val), f"session_metadata:{key}"
+        for key in ("last_total_tokens", "total_tokens", "observed_total_tokens"):
+            val = meta.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                return int(val), f"session_metadata:{key}"
 
         for message in reversed(session.messages):
             usage = message.get("usage")
@@ -304,7 +308,10 @@ class MemoryConsolidator:
                 continue
             prompt_tokens = usage.get("prompt_tokens")
             if isinstance(prompt_tokens, (int, float)) and prompt_tokens > 0:
-                return int(prompt_tokens), "message_usage"
+                return int(prompt_tokens), "message_usage:prompt_tokens"
+            total_tokens = usage.get("total_tokens")
+            if isinstance(total_tokens, (int, float)) and total_tokens > 0:
+                return int(total_tokens), "message_usage:total_tokens"
 
         return 0, "none"
 

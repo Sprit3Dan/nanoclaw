@@ -21,6 +21,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.delegate import DelegateTaskTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -155,6 +156,7 @@ class AgentLoop:
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(DelegateTaskTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -238,6 +240,11 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        turn_usage_max = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
         active_provider, active_model, route_label = await self._select_provider_for_request(messages)
         logger.info("Request route selected: {}", route_label)
@@ -253,10 +260,12 @@ class AgentLoop:
                 model=active_model,
             )
             usage = response.usage or {}
-            self._last_usage = {
-                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
-            }
+            prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+            total_tokens = int(usage.get("total_tokens", 0) or 0)
+            turn_usage_max["prompt_tokens"] = max(turn_usage_max["prompt_tokens"], prompt_tokens)
+            turn_usage_max["completion_tokens"] = max(turn_usage_max["completion_tokens"], completion_tokens)
+            turn_usage_max["total_tokens"] = max(turn_usage_max["total_tokens"], total_tokens)
 
             if response.has_tool_calls:
                 if on_progress:
@@ -306,6 +315,7 @@ class AgentLoop:
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
+        self._last_usage = turn_usage_max
         return final_content, tools_used, messages
 
     @staticmethod
@@ -724,6 +734,7 @@ class AgentLoop:
             if self._last_usage:
                 session.metadata["last_prompt_tokens"] = int(self._last_usage.get("prompt_tokens", 0) or 0)
                 session.metadata["last_completion_tokens"] = int(self._last_usage.get("completion_tokens", 0) or 0)
+                session.metadata["last_total_tokens"] = int(self._last_usage.get("total_tokens", 0) or 0)
             self.sessions.save(session)
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -799,6 +810,7 @@ class AgentLoop:
         if self._last_usage:
             session.metadata["last_prompt_tokens"] = int(self._last_usage.get("prompt_tokens", 0) or 0)
             session.metadata["last_completion_tokens"] = int(self._last_usage.get("completion_tokens", 0) or 0)
+            session.metadata["last_total_tokens"] = int(self._last_usage.get("total_tokens", 0) or 0)
         self.sessions.save(session)
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
@@ -871,6 +883,7 @@ class AgentLoop:
                     entry["usage"] = {
                         "prompt_tokens": int(self._last_usage.get("prompt_tokens", 0) or 0),
                         "completion_tokens": int(self._last_usage.get("completion_tokens", 0) or 0),
+                        "total_tokens": int(self._last_usage.get("total_tokens", 0) or 0),
                     }
             if role == "tool":
                 if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
