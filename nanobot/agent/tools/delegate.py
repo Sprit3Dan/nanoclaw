@@ -135,6 +135,14 @@ class DelegateTaskTool(Tool):
                     "type": "boolean",
                     "description": "Compatibility flag. Current implementation is fire-and-ack only.",
                 },
+                "origin_channel": {
+                    "type": "string",
+                    "description": "Optional source channel for upstream response routing (e.g., telegram, discord).",
+                },
+                "origin_chat_id": {
+                    "type": "string",
+                    "description": "Optional source chat id for upstream response routing.",
+                },
             },
             "required": ["task"],
         }
@@ -173,6 +181,20 @@ class DelegateTaskTool(Tool):
 
         metadata_raw = kwargs.get("metadata")
         metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
+
+        origin_channel_raw = kwargs.get("origin_channel")
+        origin_channel = (
+            str(origin_channel_raw).strip()
+            if isinstance(origin_channel_raw, str)
+            else ""
+        )
+
+        origin_chat_id_raw = kwargs.get("origin_chat_id")
+        origin_chat_id = (
+            str(origin_chat_id_raw).strip()
+            if isinstance(origin_chat_id_raw, str)
+            else ""
+        )
 
         vectordns_domain_raw = kwargs.get("vectordns_domain")
         vectordns_domain = (
@@ -259,6 +281,11 @@ class DelegateTaskTool(Tool):
             "resolver": resolver,
             "owner_name": owner_name,
         }
+
+        if origin_channel:
+            extra.setdefault("upstream_channel", origin_channel)
+        if origin_chat_id:
+            extra.setdefault("upstream_chat_id", origin_chat_id)
 
         msg = OutboundMessage(
             channel="a2a",

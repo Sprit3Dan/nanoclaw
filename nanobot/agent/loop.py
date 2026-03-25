@@ -185,10 +185,32 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
+        self._current_origin_channel = channel
+        self._current_origin_chat_id = chat_id
+
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+
+        # Ensure delegate_task always receives inbound origin context unless explicitly overridden.
+        if delegate_tool := self.tools.get("delegate_task"):
+            if not getattr(delegate_tool, "_origin_ctx_wrapped", False):
+                original_execute = delegate_tool.execute
+
+                async def _execute_with_origin(**kwargs: Any) -> Any:
+                    kwargs.setdefault(
+                        "origin_channel",
+                        getattr(self, "_current_origin_channel", ""),
+                    )
+                    kwargs.setdefault(
+                        "origin_chat_id",
+                        getattr(self, "_current_origin_chat_id", ""),
+                    )
+                    return await original_execute(**kwargs)
+
+                delegate_tool.execute = _execute_with_origin  # type: ignore[method-assign]
+                delegate_tool._origin_ctx_wrapped = True  # type: ignore[attr-defined]
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -822,6 +844,29 @@ class AgentLoop:
 
         response_metadata = dict(msg.metadata or {})
         if msg.channel == "a2a":
+            upstream_channel_raw = response_metadata.get("upstream_channel")
+            upstream_chat_id_raw = response_metadata.get("upstream_chat_id")
+            upstream_channel = (
+                str(upstream_channel_raw).strip()
+                if isinstance(upstream_channel_raw, str)
+                else ""
+            )
+            upstream_chat_id = (
+                str(upstream_chat_id_raw).strip()
+                if isinstance(upstream_chat_id_raw, str)
+                else ""
+            )
+
+            # If delegation carried original user routing info, respond there directly.
+            if upstream_channel and upstream_chat_id:
+                return OutboundMessage(
+                    channel=upstream_channel,
+                    chat_id=upstream_chat_id,
+                    content=final_content,
+                    metadata=response_metadata,
+                )
+
+            # Fallback: reply over A2A to sender of the inbound envelope.
             raw_a2a = response_metadata.get("_a2a")
             a2a_ctx = raw_a2a if isinstance(raw_a2a, dict) else {}
             origin_agent = str(a2a_ctx.get("from_agent") or msg.sender_id).strip() or str(msg.sender_id)
