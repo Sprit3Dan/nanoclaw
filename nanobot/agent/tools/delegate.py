@@ -88,7 +88,11 @@ class DelegateTaskTool(Tool):
                 },
                 "discovery_register_url": {
                     "type": "string",
-                    "description": "Optional registry URL for one-time self registration. If omitted, NANOBOT_DISCOVERY_REGISTER_URL is used.",
+                    "description": (
+                        "Optional register endpoint URL for one-time self registration. "
+                        "If omitted, NANOBOT_DISCOVERY_BASE_URL is preferred and "
+                        "NANOBOT_DISCOVERY_REGISTER_URL is used as legacy fallback."
+                    ),
                     "minLength": 1,
                 },
                 "target_agent": {
@@ -156,13 +160,24 @@ class DelegateTaskTool(Tool):
         discovery_register_url = (
             str(register_url_raw).strip() if register_url_raw is not None else ""
         )
+
+        if not discovery_register_url:
+            discovery_base_url = str(
+                os.environ.get("NANOBOT_DISCOVERY_BASE_URL", "")
+            ).strip()
+            if discovery_base_url:
+                discovery_register_url = self._register_url_from_base(discovery_base_url)
+
+        # Legacy fallback for compatibility
         if not discovery_register_url:
             discovery_register_url = str(
                 os.environ.get("NANOBOT_DISCOVERY_REGISTER_URL", "")
             ).strip()
+
         if not discovery_register_url:
             return (
                 "Error: discovery_register_url is required unless "
+                "NANOBOT_DISCOVERY_BASE_URL (preferred) or "
                 "NANOBOT_DISCOVERY_REGISTER_URL is set."
             )
 
@@ -237,7 +252,17 @@ class DelegateTaskTool(Tool):
             timeout_ms=timeout_ms,
         )
         if route is None:
-            return f"Error: VectorDNS SRV resolution failed for '{owner_name}'."
+            route = await self._resolve_http_discover(
+                discovery_register_url=discovery_register_url,
+                task=task,
+                intent=route_intent,
+                target_agent=target_agent,
+            )
+        if route is None:
+            return (
+                f"Error: VectorDNS SRV resolution failed for '{owner_name}' "
+                "and HTTP discovery fallback did not return a valid route."
+            )
 
         # Keep chat_id semantic as agent id if possible; A2A will use a2a_peer_base route hint directly.
         chat_id = target_agent or route.agent_id or route.host.split(".", 1)[0]
@@ -270,6 +295,121 @@ class DelegateTaskTool(Tool):
                 f"(mode={mode_l}). await_result=true requested; delivery is queued."
             )
         return f"Delegated task {task_id} to {chat_id} via {route.base_url} (mode={mode_l})."
+
+    @staticmethod
+    def _normalize_discovery_base_url(url: str) -> str:
+        u = url.strip().rstrip("/")
+        if u.endswith("/register"):
+            return u[: -len("/register")]
+        if u.endswith("/discover"):
+            return u[: -len("/discover")]
+        return u
+
+    @classmethod
+    def _register_url_from_base(cls, discovery_base_url: str) -> str:
+        base = cls._normalize_discovery_base_url(discovery_base_url)
+        return f"{base}/register"
+
+    @classmethod
+    def _discover_url_from_register(cls, discovery_register_url: str) -> str:
+        base = cls._normalize_discovery_base_url(discovery_register_url)
+        return f"{base}/discover"
+
+    async def _resolve_http_discover(
+        self,
+        *,
+        discovery_register_url: str,
+        task: str,
+        intent: str,
+        target_agent: str | None,
+    ) -> _ResolvedRoute | None:
+        discover_url = self._discover_url_from_register(discovery_register_url)
+        client = await self._ensure_http_client()
+
+        body: dict[str, Any] = {
+            "task": task,
+            "intent": intent,
+        }
+        if target_agent:
+            body["target_agent"] = target_agent
+
+        try:
+            resp = await client.get(discover_url, params=body)
+        except Exception:
+            return None
+
+        if resp.status_code >= 400:
+            return None
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        route_obj = payload.get("route")
+        route = route_obj if isinstance(route_obj, dict) else payload
+
+        base_url_raw = route.get("base_url")
+        host_raw = route.get("host")
+        port_raw = route.get("port")
+        agent_id_raw = route.get("agent_id") or payload.get("agent_id")
+
+        base_url: str | None = None
+        host: str | None = None
+        port: int | None = None
+
+        if isinstance(base_url_raw, str) and base_url_raw.strip():
+            candidate = base_url_raw.strip().rstrip("/")
+            try:
+                u = httpx.URL(candidate)
+                if u.scheme in {"http", "https"} and u.host:
+                    base_url = candidate
+                    host = u.host
+                    parsed_port = u.port
+                    if isinstance(parsed_port, int):
+                        port = parsed_port
+                    else:
+                        port = 443 if u.scheme == "https" else 80
+            except Exception:
+                return None
+
+        if base_url is None:
+            if not isinstance(host_raw, str) or not host_raw.strip():
+                return None
+
+            parsed_port_value: int | None = None
+            if isinstance(port_raw, int):
+                parsed_port_value = port_raw
+            elif isinstance(port_raw, float):
+                parsed_port_value = int(port_raw)
+            elif isinstance(port_raw, str):
+                raw = port_raw.strip()
+                if raw:
+                    try:
+                        parsed_port_value = int(raw)
+                    except Exception:
+                        parsed_port_value = None
+
+            if parsed_port_value is None or parsed_port_value <= 0:
+                return None
+
+            port = parsed_port_value
+            host = host_raw.strip()
+            base_url = f"http://{host}:{port}"
+
+        agent_id: str | None = None
+        if isinstance(agent_id_raw, str) and agent_id_raw.strip():
+            agent_id = agent_id_raw.strip()
+        elif host:
+            agent_id = self._agent_from_target(host)
+
+        if not host or port is None or not base_url:
+            return None
+
+        return _ResolvedRoute(agent_id=agent_id, host=host, port=port, base_url=base_url)
 
     async def _register_once(self, discovery_register_url: str) -> None:
         url = discovery_register_url.strip()
