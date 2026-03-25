@@ -857,8 +857,16 @@ class AgentLoop:
                 else ""
             )
 
-            # If delegation carried original user routing info, respond there directly.
-            if upstream_channel and upstream_chat_id:
+            upstream_channel_enabled = False
+            if upstream_channel and self.channels_config is not None:
+                section = getattr(self.channels_config, upstream_channel, None)
+                if isinstance(section, dict):
+                    upstream_channel_enabled = bool(section.get("enabled", False))
+                elif section is not None:
+                    upstream_channel_enabled = bool(getattr(section, "enabled", False))
+
+            # If delegation carried original user routing info and that channel is enabled here, respond there directly.
+            if upstream_channel and upstream_chat_id and upstream_channel_enabled:
                 return OutboundMessage(
                     channel=upstream_channel,
                     chat_id=upstream_chat_id,
