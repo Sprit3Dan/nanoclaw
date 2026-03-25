@@ -86,15 +86,7 @@ class DelegateTaskTool(Tool):
                     "description": "Task content to send to another agent.",
                     "minLength": 1,
                 },
-                "discovery_register_url": {
-                    "type": "string",
-                    "description": (
-                        "Optional register endpoint URL for one-time self registration. "
-                        "If omitted, NANOBOT_DISCOVERY_BASE_URL is preferred and "
-                        "NANOBOT_DISCOVERY_REGISTER_URL is used as legacy fallback."
-                    ),
-                    "minLength": 1,
-                },
+
                 "target_agent": {
                     "type": "string",
                     "description": "Optional explicit agent id. If omitted, semantic/default SRV name is used.",
@@ -156,30 +148,17 @@ class DelegateTaskTool(Tool):
         if not task:
             return "Error: task must be non-empty."
 
-        register_url_raw = kwargs.get("discovery_register_url", "")
+        discovery_base_url = str(
+            os.environ.get("NANOBOT_DISCOVERY_BASE_URL", "")
+        ).strip()
         discovery_register_url = (
-            str(register_url_raw).strip() if register_url_raw is not None else ""
+            self._register_url_from_base(discovery_base_url)
+            if discovery_base_url
+            else ""
         )
 
         if not discovery_register_url:
-            discovery_base_url = str(
-                os.environ.get("NANOBOT_DISCOVERY_BASE_URL", "")
-            ).strip()
-            if discovery_base_url:
-                discovery_register_url = self._register_url_from_base(discovery_base_url)
-
-        # Legacy fallback for compatibility
-        if not discovery_register_url:
-            discovery_register_url = str(
-                os.environ.get("NANOBOT_DISCOVERY_REGISTER_URL", "")
-            ).strip()
-
-        if not discovery_register_url:
-            return (
-                "Error: discovery_register_url is required unless "
-                "NANOBOT_DISCOVERY_BASE_URL (preferred) or "
-                "NANOBOT_DISCOVERY_REGISTER_URL is set."
-            )
+            return "Error: NANOBOT_DISCOVERY_BASE_URL is required."
 
         target_agent_raw = kwargs.get("target_agent")
         target_agent = str(target_agent_raw).strip() if isinstance(target_agent_raw, str) else None
