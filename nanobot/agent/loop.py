@@ -22,6 +22,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.delegate import DelegateTaskTool
+from nanobot.agent.tools.delegation_tasks import DelegationTasksTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -156,7 +157,11 @@ class AgentLoop:
         self.tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
-        self.tools.register(DelegateTaskTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(DelegateTaskTool(
+            send_callback=self.bus.publish_outbound,
+            delegation_queue=self.bus.delegation,
+        ))
+        self.tools.register(DelegationTasksTool(delegation_map=self.bus.delegation_map))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -844,6 +849,20 @@ class AgentLoop:
 
         response_metadata = dict(msg.metadata or {})
         if msg.channel == "a2a":
+            # Correlate by delegated task id via direct map lookup (order-independent).
+            active_delegation = self.bus.delegation.resolve(response_metadata)
+            if active_delegation is not None:
+                reply_channel = active_delegation.reply_channel
+                reply_chat_id = active_delegation.reply_chat_id
+                if reply_channel and reply_chat_id:
+                    self.bus.delegation.mark_completed(active_delegation.id)
+                    return OutboundMessage(
+                        channel=reply_channel,
+                        chat_id=reply_chat_id,
+                        content=final_content,
+                        metadata=response_metadata,
+                    )
+
             upstream_channel_raw = response_metadata.get("upstream_channel")
             upstream_chat_id_raw = response_metadata.get("upstream_chat_id")
             upstream_channel = (

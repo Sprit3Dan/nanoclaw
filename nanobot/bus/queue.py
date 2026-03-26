@@ -1,7 +1,9 @@
 """Async message queue for decoupled channel-agent communication."""
 
 import asyncio
+import time
 
+from nanobot.bus.delegation import DelegationTaskMap
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
 
@@ -16,6 +18,8 @@ class MessageBus:
     def __init__(self):
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+        self.delegation_map = DelegationTaskMap()
+        self.delegation = self.delegation_map
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
@@ -42,3 +46,36 @@ class MessageBus:
     def outbound_size(self) -> int:
         """Number of pending outbound messages."""
         return self.outbound.qsize()
+
+    def pending_delegation_report(
+        self,
+        *,
+        older_than_seconds: int | None = None,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        """Return a compact report of active delegation tasks."""
+        rows = self.delegation_map.list_active()
+        now = time.time()
+
+        if older_than_seconds is not None:
+            cutoff = now - max(1, int(older_than_seconds))
+            rows = [t for t in rows if t.created_at <= cutoff]
+
+        rows.sort(key=lambda t: t.created_at)
+        rows = rows[: max(1, int(limit))]
+
+        return {
+            "count": len(rows),
+            "pending": [
+                {
+                    "id": t.id,
+                    "status": t.status,
+                    "age_seconds": max(0, int(now - t.created_at)),
+                    "reply_channel": t.reply_channel,
+                    "reply_chat_id": t.reply_chat_id,
+                    "delegated_task_id": t.delegated_task_id,
+                    "delegated_agent_id": t.delegated_agent_id,
+                }
+                for t in rows
+            ],
+        }

@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager, nullcontext
 
 import os
+from os import environ
 import select
 import signal
 import sys
@@ -436,7 +437,7 @@ def _make_provider(
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         provider = OpenAICodexProvider(default_model=model)
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    elif provider_name in {"custom", "custom_router", "custom_vision", "custom_vl"}:
+    elif provider_name in {"custom", "custom_router", "custom_vision", "custom_vl", "custom_reasoning"}:
         from nanobot.providers.custom_provider import CustomProvider
         provider = CustomProvider(
             api_key=p.api_key if p else "no-key",
@@ -839,6 +840,51 @@ def gateway(
         return "cli", "direct"
 
     # Create heartbeat service
+    def _build_heartbeat_tasks(tasks: str) -> str:
+        """Build heartbeat prompt with stale pending delegation follow-up instructions."""
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return max(1, int(environ.get(name, str(default)) or default))
+            except Exception:
+                return default
+
+        stale_seconds = _env_int("NANOBOT_HEARTBEAT_PENDING_DELEGATION_STALE_SECONDS", 120)
+        limit = _env_int("NANOBOT_HEARTBEAT_PENDING_DELEGATION_LIMIT", 20)
+        report = bus.pending_delegation_report(
+            older_than_seconds=stale_seconds,
+            limit=limit,
+        )
+        pending = report.get("pending", [])
+        base = (tasks or "").strip()
+
+        if not isinstance(pending, list) or not pending:
+            return base
+
+        lines = [base] if base else []
+        lines += [
+            "",
+            "Delegation follow-up (auto-generated):",
+            (
+                f"Check each pending delegation older than {stale_seconds} seconds, "
+                "follow up with delegated agent status, and send updates to the reply target."
+            ),
+        ]
+        for item in pending:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                "- delegation_id={id} delegated_task_id={task_id} delegated_agent={agent} "
+                "age_s={age} reply={channel}:{chat}".format(
+                    id=item.get("id", ""),
+                    task_id=item.get("delegated_task_id", ""),
+                    agent=item.get("delegated_agent_id", ""),
+                    age=item.get("age_seconds", ""),
+                    channel=item.get("reply_channel", ""),
+                    chat=item.get("reply_chat_id", ""),
+                )
+            )
+        return "\n".join(lines).strip()
+
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
@@ -847,7 +893,7 @@ def gateway(
             pass
 
         resp = await agent.process_direct(
-            tasks,
+            _build_heartbeat_tasks(tasks),
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,
@@ -870,6 +916,7 @@ def gateway(
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
+        instruction_provider=lambda: _build_heartbeat_tasks(""),
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
     )

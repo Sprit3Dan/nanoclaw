@@ -154,6 +154,7 @@ class ProvidersConfig(Base):
     custom_router: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible endpoint for reasoning routing
     custom_vision: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible vision endpoint
     custom_vl: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible vision-language endpoint
+    custom_reasoning: ProviderConfig = Field(default_factory=ProviderConfig)  # Dedicated OpenAI-compatible endpoint for reasoning-heavy workloads
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)

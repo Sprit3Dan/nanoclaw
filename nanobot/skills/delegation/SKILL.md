@@ -85,3 +85,17 @@ After delegation, acknowledge briefly:
 - who/where it was delegated (if known),
 - task id if returned,
 - that you will proceed with orchestration or wait for result as needed.
+
+## Heartbeat follow-up for pending delegations
+
+When heartbeat runs, stale pending delegations may be auto-included for follow-up.
+
+Environment variables:
+
+- `NANOBOT_HEARTBEAT_PENDING_DELEGATION_STALE_SECONDS` — minimum age (seconds) before a pending delegation is included for heartbeat follow-up. Default: `120`.
+- `NANOBOT_HEARTBEAT_PENDING_DELEGATION_LIMIT` — max number of stale pending delegations included per heartbeat cycle. Default: `20`.
+
+Guidance:
+
+- Keep delegated tasks specific so heartbeat follow-up prompts remain concise.
+- If delegation is still pending, ask for status from the delegated agent and send progress to the original reply target.

@@ -57,6 +57,7 @@ class HeartbeatService:
         model: str,
         on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        instruction_provider: Callable[[], str | None] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
     ):
@@ -65,6 +66,7 @@ class HeartbeatService:
         self.model = model
         self.on_execute = on_execute
         self.on_notify = on_notify
+        self.instruction_provider = instruction_provider
         self.interval_s = interval_s
         self.enabled = enabled
         self._running = False
@@ -81,6 +83,27 @@ class HeartbeatService:
             except Exception:
                 return None
         return None
+
+    def _read_dynamic_instructions(self) -> str | None:
+        if not self.instruction_provider:
+            return None
+        try:
+            value = self.instruction_provider()
+        except Exception:
+            logger.exception("Heartbeat: instruction_provider failed")
+            return None
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text or None
+
+    def _resolve_heartbeat_content(self) -> str | None:
+        file_content = self._read_heartbeat_file()
+        dynamic = self._read_dynamic_instructions()
+
+        if file_content and dynamic:
+            return f"{file_content}\n\n## Runtime Instructions\n\n{dynamic}"
+        return dynamic or file_content
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call.
@@ -144,7 +167,7 @@ class HeartbeatService:
         """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response
 
-        content = self._read_heartbeat_file()
+        content = self._resolve_heartbeat_content()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
             return
@@ -176,7 +199,7 @@ class HeartbeatService:
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat."""
-        content = self._read_heartbeat_file()
+        content = self._resolve_heartbeat_content()
         if not content:
             return None
         action, tasks = await self._decide(content)

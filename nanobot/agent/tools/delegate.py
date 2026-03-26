@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from nanobot.agent.tools.base import Tool
+from nanobot.bus.delegation import DelegationTaskMap
 from nanobot.bus.events import OutboundMessage
 
 
@@ -32,6 +33,7 @@ class DelegateTaskTool(Tool):
     def __init__(
         self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
+        delegation_queue: DelegationTaskMap | None = None,
         *,
         default_vectordns_domain: str | None = None,
         default_vectordns_resolver: str | None = None,
@@ -42,6 +44,7 @@ class DelegateTaskTool(Tool):
         listen_port: int = 19100,
     ):
         self._send_callback = send_callback
+        self._delegation_queue = delegation_queue
 
         self._default_domain = (
             default_vectordns_domain
@@ -286,6 +289,22 @@ class DelegateTaskTool(Tool):
             extra.setdefault("upstream_channel", origin_channel)
         if origin_chat_id:
             extra.setdefault("upstream_chat_id", origin_chat_id)
+
+        if self._delegation_queue and origin_channel and origin_chat_id:
+            local_task = self._delegation_queue.create(
+                reply_channel=origin_channel,
+                reply_chat_id=origin_chat_id,
+                origin_channel=origin_channel,
+                origin_chat_id=origin_chat_id,
+                delegated_channel="a2a",
+            )
+            self._delegation_queue.bind_delegated_task_id(
+                delegation_task_id=local_task.id,
+                delegated_task_id=task_id,
+                delegated_agent_id=chat_id,
+            )
+            extra["delegation_task_id"] = local_task.id
+            extra["_delegation"]["delegation_task_id"] = local_task.id
 
         msg = OutboundMessage(
             channel="a2a",
