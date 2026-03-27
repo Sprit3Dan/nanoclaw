@@ -70,18 +70,17 @@ class MessageTool(Tool):
             "required": ["content"]
         }
 
-    async def execute(
-        self,
-        content: str,
-        channel: str | None = None,
-        chat_id: str | None = None,
-        message_id: str | None = None,
-        media: list[str] | None = None,
-        **kwargs: Any
-    ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
+    async def execute(self, **kwargs: Any) -> str:
+        content = kwargs.get("content")
+        channel = kwargs.get("channel") or self._default_channel
+        chat_id = kwargs.get("chat_id") or self._default_chat_id
+        message_id = kwargs.get("message_id") or self._default_message_id
+        media = kwargs.get("media")
+
+        if content is None:
+            return "Error: Missing required parameter 'content'"
+
+        content = str(content)
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
@@ -89,11 +88,18 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        is_default_target = channel == self._default_channel and chat_id == self._default_chat_id
+
+        normalized_media = tuple(
+            m.strip() for m in (media or [])
+            if isinstance(m, str) and m.strip()
+        )
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            media=media or [],
+            media=list(normalized_media),
             metadata={
                 "message_id": message_id,
             },
@@ -101,9 +107,9 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
+            if is_default_target:
                 self._sent_in_turn = True
-            media_info = f" with {len(media)} attachments" if media else ""
+            media_info = f" with {len(normalized_media)} attachments" if normalized_media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
             return f"Error sending message: {str(e)}"

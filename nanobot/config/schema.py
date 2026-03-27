@@ -80,16 +80,6 @@ class RouteDescriptions(Base):
 class RoutingConfig(Base):
     """Request-routing policy configuration."""
 
-    # Naming normalized to primary / secondary / vision.
-    # Backward compatible aliases:
-    # - custom_* -> primary_*
-    # - reasoning_* -> secondary_*
-    # - vl_* -> vision_*
-    primary_share: float = Field(
-        default=0.85,
-        validation_alias=AliasChoices("primary_share", "primaryShare", "custom_share", "customShare"),
-    )
-
     # Optional per-route provider/model overrides.
     # If unset, nanobot uses existing defaults from `agents.defaults` and provider auto-matching.
     primary_provider: str | None = Field(

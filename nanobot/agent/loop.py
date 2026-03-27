@@ -272,6 +272,8 @@ class AgentLoop:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        consecutive_message_only_tool_rounds = 0
+        max_consecutive_message_only_tool_rounds = 3
 
         active_provider, active_model, route_label = await self._select_provider_for_request(messages)
         logger.info("Request route selected: {}", route_label)
@@ -295,6 +297,23 @@ class AgentLoop:
             turn_usage_max["total_tokens"] = max(turn_usage_max["total_tokens"], total_tokens)
 
             if response.has_tool_calls:
+                tool_names = [tc.name for tc in response.tool_calls]
+                if tool_names and all(name == "message" for name in tool_names):
+                    consecutive_message_only_tool_rounds += 1
+                else:
+                    consecutive_message_only_tool_rounds = 0
+
+                if consecutive_message_only_tool_rounds > max_consecutive_message_only_tool_rounds:
+                    logger.warning(
+                        "Runaway message-only tool loop detected ({} consecutive rounds), stopping",
+                        consecutive_message_only_tool_rounds,
+                    )
+                    final_content = (
+                        "I stopped to avoid a runaway messaging loop. "
+                        "Please resend your request and I will continue."
+                    )
+                    break
+
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
@@ -805,7 +824,28 @@ class AgentLoop:
             )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        tool_channel = msg.channel
+        tool_chat_id = msg.chat_id
+        msg_meta = msg.metadata or {}
+
+        if msg.channel == "a2a":
+            upstream_channel_raw = msg_meta.get("upstream_channel")
+            upstream_chat_id_raw = msg_meta.get("upstream_chat_id")
+            upstream_channel = (
+                str(upstream_channel_raw).strip()
+                if isinstance(upstream_channel_raw, str)
+                else ""
+            )
+            upstream_chat_id = (
+                str(upstream_chat_id_raw).strip()
+                if isinstance(upstream_chat_id_raw, str)
+                else ""
+            )
+            if upstream_channel and upstream_chat_id:
+                tool_channel = upstream_channel
+                tool_chat_id = upstream_chat_id
+
+        self._set_tool_context(tool_channel, tool_chat_id, msg_meta.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()

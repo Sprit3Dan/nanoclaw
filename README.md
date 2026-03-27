@@ -937,8 +937,6 @@ Merge this section into `~/.nanobot/config.json`:
 ```json
 {
   "routing": {
-    "primaryShare": 0.85,
-
     "primaryProvider": "auto",
     "primaryModel": null,
 
@@ -968,8 +966,6 @@ Merge this section into `~/.nanobot/config.json`:
 
 Key meanings:
 
-- `primaryShare`: target bias for `primary` in the router prompt (for example `0.85`).
-
 Per-route provider/model overrides (can point to any configured provider):
 - `primaryProvider` / `primaryModel`: default route backend for `primary`.
 - `routerProvider` / `routerModel`: tiny routing classifier backend.
@@ -991,7 +987,6 @@ Prompt steering:
 - `forcePrimaryPatterns` / `forceVisionPatterns` / `forceSecondaryPatterns`: substring rules applied before router LLM call.
 
 Legacy aliases remain supported:
-- `customShare` → `primaryShare`
 - `vlProvider` / `vlModel` → `visionProvider` / `visionModel`
 - `reasoningProvider` / `reasoningModel` → `secondaryProvider` / `secondaryModel`
 - `forceCustomPatterns` / `forceVlPatterns` / `forceReasoningPatterns` → `forcePrimaryPatterns` / `forceVisionPatterns` / `forceSecondaryPatterns`
@@ -1050,7 +1045,6 @@ Concrete `custom` + `custom_vl` setup example:
     }
   },
   "routing": {
-    "primaryShare": 0.85,
     "primaryProvider": "custom",
     "primaryModel": "nemotron-30b",
     "visionProvider": "custom_vl",
