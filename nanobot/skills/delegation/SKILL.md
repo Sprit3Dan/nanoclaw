@@ -29,11 +29,6 @@ Optional (use only when needed):
 - `intent` — short routing hint; keep it 2–6 words. Example: `aircraft_overhead_check`
 - `metadata` — structured context for downstream logic (ids, constraints, trace fields), not long prose.
 - `mode` — delivery mode: `push` (default), `async`, or `sse`.
-- `vectordns_domain` — DNS zone override for SRV lookup.
-- `vectordns_resolver` — DNS resolver host/IP override.
-- `vectordns_port` — DNS resolver port override.
-- `vectordns_timeout_ms` — SRV lookup timeout override.
-- `vectordns_name` — full SRV owner name override (advanced).
 - `origin_channel` — original user channel for upstream routing. Example: `telegram`
 - `origin_chat_id` — original user chat id for upstream routing. Example: `269831658`
 

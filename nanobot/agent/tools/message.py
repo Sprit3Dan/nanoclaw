@@ -7,7 +7,10 @@ from nanobot.bus.events import OutboundMessage
 
 
 class MessageTool(Tool):
-    """Tool to send messages to users on chat channels."""
+    """Tool to send messages to users on chat channels.
+
+    Calling this tool is a terminal action for the model's current turn.
+    """
 
     def __init__(
         self,
@@ -42,7 +45,10 @@ class MessageTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Send a message to the user. Use this when you want to communicate something."
+        return (
+            "Send a message to the user. Use this when you want to communicate something. "
+            "Calling this tool ends your current turn, so do it only after all other needed tools."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:

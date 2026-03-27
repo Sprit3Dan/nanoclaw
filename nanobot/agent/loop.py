@@ -332,7 +332,16 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
+                ordered_tool_calls = [
+                    tc for tc in response.tool_calls
+                    if tc.name != "message"
+                ] + [
+                    tc for tc in response.tool_calls
+                    if tc.name == "message"
+                ]
+                end_turn_after_message = any(tc.name == "message" for tc in ordered_tool_calls)
+
+                for tool_call in ordered_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
@@ -340,6 +349,9 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
+                if end_turn_after_message:
+                    break
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
