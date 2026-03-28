@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Mapping
 
+from loguru import logger
+
 
 @dataclass(slots=True)
 class DelegationTask:
@@ -87,6 +89,15 @@ class DelegationTaskMap:
         with self._lock:
             self._tasks[task.id] = task
 
+        logger.debug(
+            "delegation.create local_id={} reply={}#{} origin={}#{} delegated_channel={}",
+            task.id,
+            task.reply_channel,
+            task.reply_chat_id,
+            task.origin_channel,
+            task.origin_chat_id,
+            task.delegated_channel,
+        )
         return task
 
     def get(self, delegation_task_id: str) -> DelegationTask | None:
@@ -104,11 +115,21 @@ class DelegationTaskMap:
         local_id = str(delegation_task_id).strip()
         remote_id = str(delegated_task_id).strip()
         if not local_id or not remote_id:
+            logger.debug(
+                "delegation.bind skipped invalid ids local_id='{}' remote_id='{}'",
+                local_id,
+                remote_id,
+            )
             return False
 
         with self._lock:
             task = self._tasks.get(local_id)
             if task is None or not task.is_active():
+                logger.debug(
+                    "delegation.bind skipped local_id={} reason={}",
+                    local_id,
+                    "not_found" if task is None else f"inactive:{task.status}",
+                )
                 return False
 
             task.delegated_task_id = remote_id
@@ -117,6 +138,13 @@ class DelegationTaskMap:
             task.status = "dispatched"
             task.updated_at = time.time()
             self._by_delegated_task_id[remote_id] = task.id
+            logger.debug(
+                "delegation.bind local_id={} remote_id={} remote_agent_id={} status={}",
+                task.id,
+                remote_id,
+                task.delegated_agent_id,
+                task.status,
+            )
             return True
 
     def resolve(self, metadata: Mapping[str, Any] | None) -> DelegationTask | None:
@@ -129,6 +157,7 @@ class DelegationTaskMap:
         """
         candidates = self._extract_task_id_candidates(metadata)
         if not candidates:
+            logger.debug("delegation.resolve no task-id candidates in metadata")
             return None
 
         with self._lock:
@@ -138,7 +167,15 @@ class DelegationTaskMap:
                     continue
                 task = self._tasks.get(local_id)
                 if task and task.is_active():
+                    logger.debug(
+                        "delegation.resolve matched remote_id={} -> local_id={} status={}",
+                        remote_id,
+                        task.id,
+                        task.status,
+                    )
                     return task
+
+        logger.debug("delegation.resolve no active match candidates={}", candidates)
         return None
 
     def resolve_reply_target(self, metadata: Mapping[str, Any] | None) -> tuple[str, str] | None:
@@ -153,17 +190,29 @@ class DelegationTaskMap:
     def mark_completed(self, delegation_task_id: str) -> bool:
         local_id = str(delegation_task_id).strip()
         if not local_id:
+            logger.debug("delegation.complete skipped empty local_id")
             return False
 
         with self._lock:
             task = self._tasks.get(local_id)
             if task is None or not task.is_active():
+                logger.debug(
+                    "delegation.complete skipped local_id={} reason={}",
+                    local_id,
+                    "not_found" if task is None else f"inactive:{task.status}",
+                )
                 return False
             task.status = "completed"
             task.completed_at = time.time()
             task.updated_at = task.completed_at
             if task.delegated_task_id:
                 self._by_delegated_task_id.pop(task.delegated_task_id, None)
+            logger.debug(
+                "delegation.complete local_id={} remote_id={} completed_at={}",
+                task.id,
+                task.delegated_task_id,
+                task.completed_at,
+            )
             return True
 
     def expire(self, *, older_than_seconds: int) -> int:
@@ -183,7 +232,14 @@ class DelegationTaskMap:
                 if task.delegated_task_id:
                     self._by_delegated_task_id.pop(task.delegated_task_id, None)
                 expired += 1
+                logger.debug(
+                    "delegation.expire local_id={} remote_id={} ttl_s={}",
+                    task.id,
+                    task.delegated_task_id,
+                    ttl,
+                )
 
+        logger.debug("delegation.expire summary ttl_s={} expired={}", ttl, expired)
         return expired
 
     def list_active(self) -> list[DelegationTask]:

@@ -23,6 +23,7 @@ from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.delegate import DelegateTaskTool
 from nanobot.agent.tools.delegation_tasks import DelegationTasksTool
+from nanobot.agent.tools.delegation_remote_status import DelegationRemoteStatusTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -162,6 +163,7 @@ class AgentLoop:
             delegation_queue=self.bus.delegation,
         ))
         self.tools.register(DelegationTasksTool(delegation_map=self.bus.delegation_map))
+        self.tools.register(DelegationRemoteStatusTool(delegation_map=self.bus.delegation_map))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))

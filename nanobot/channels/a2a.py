@@ -221,6 +221,32 @@ class A2AChannel(BaseChannel):
         resp = await client.post(url, json={"envelope": envelope, "stream": False})
         if resp.status_code >= 400:
             logger.warning("A2A async submit failed [{}]: {}", resp.status_code, resp.text[:300])
+            return
+
+        try:
+            payload = resp.json()
+        except Exception:
+            logger.warning("A2A async submit returned non-JSON response")
+            return
+
+        remote_task_id = str(payload.get("task_id", "")).strip() or None
+        status_url, events_url = self._extract_submit_urls(peer_base, payload)
+
+        logger.debug(
+            "A2A async submit accepted: to_agent='{}' local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
+            envelope.get("to_agent"),
+            envelope.get("task_id"),
+            remote_task_id,
+            status_url,
+            events_url,
+        )
+
+        self._record_delegation_submit_tracking(
+            envelope,
+            remote_task_id=remote_task_id,
+            status_url=status_url,
+            events_url=events_url,
+        )
 
     async def _send_sse(self, peer_base: str, envelope: dict[str, Any]) -> None:
         client = await self._ensure_client()
@@ -241,7 +267,25 @@ class A2AChannel(BaseChannel):
             logger.warning("A2A sse submit did not return task_id")
             return
 
-        events_url = self._join_url(peer_base, f"{self.config.events_prefix}/{task_id}")
+        status_url, events_url = self._extract_submit_urls(peer_base, payload)
+        if not events_url:
+            events_url = self._join_url(peer_base, f"{self.config.events_prefix}/{task_id}")
+
+        logger.debug(
+            "A2A sse submit accepted: to_agent='{}' local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
+            envelope.get("to_agent"),
+            envelope.get("task_id"),
+            task_id,
+            status_url,
+            events_url,
+        )
+
+        self._record_delegation_submit_tracking(
+            envelope,
+            remote_task_id=task_id,
+            status_url=status_url,
+            events_url=events_url,
+        )
 
         # Consume events until completion/failure or timeout.
         try:
@@ -265,6 +309,98 @@ class A2AChannel(BaseChannel):
                         break
         except Exception as e:
             logger.warning("A2A SSE stream failed for task {}: {}", task_id, e)
+
+    def _extract_submit_urls(self, peer_base: str, payload: dict[str, Any]) -> tuple[str | None, str | None]:
+        def _abs(value: Any) -> str | None:
+            if not isinstance(value, str):
+                return None
+            raw = value.strip()
+            if not raw:
+                return None
+            try:
+                parsed = urlsplit(raw)
+            except Exception:
+                return None
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                return raw.rstrip("/")
+            path = raw if raw.startswith("/") else f"/{raw}"
+            return self._join_url(peer_base, path)
+
+        status_url = _abs(payload.get("status_url"))
+        events_url = _abs(payload.get("events_url"))
+        return status_url, events_url
+
+    def _record_delegation_submit_tracking(
+        self,
+        envelope: dict[str, Any],
+        *,
+        remote_task_id: str | None,
+        status_url: str | None,
+        events_url: str | None,
+    ) -> None:
+        raw_metadata = envelope.get("metadata")
+        if not isinstance(raw_metadata, dict):
+            return
+
+        metadata = raw_metadata
+        raw_delegation = metadata.get("_delegation")
+        delegation_meta = raw_delegation if isinstance(raw_delegation, dict) else None
+
+        if remote_task_id:
+            metadata["a2a_remote_task_id"] = remote_task_id
+            if delegation_meta is not None:
+                delegation_meta["remote_task_id"] = remote_task_id
+
+        if status_url:
+            metadata["a2a_remote_status_url"] = status_url
+            if delegation_meta is not None:
+                delegation_meta["remote_status_url"] = status_url
+
+        if events_url:
+            metadata["a2a_remote_events_url"] = events_url
+            if delegation_meta is not None:
+                delegation_meta["remote_events_url"] = events_url
+
+        local_task_id_raw = metadata.get("delegation_task_id")
+        if not local_task_id_raw and delegation_meta is not None:
+            local_task_id_raw = delegation_meta.get("delegation_task_id")
+
+        local_task_id = (
+            str(local_task_id_raw).strip()
+            if isinstance(local_task_id_raw, str)
+            else ""
+        )
+        if not local_task_id:
+            logger.debug(
+                "A2A delegation submit tracking skipped: missing local delegation_task_id for remote_task_id='{}'",
+                remote_task_id,
+            )
+            return
+
+        local_task = self.bus.delegation.get(local_task_id)
+        if local_task is None:
+            logger.debug(
+                "A2A delegation submit tracking skipped: local delegation task not found id='{}' remote_task_id='{}'",
+                local_task_id,
+                remote_task_id,
+            )
+            return
+
+        if remote_task_id:
+            local_task.metadata["remote_task_id"] = remote_task_id
+        if status_url:
+            local_task.metadata["remote_status_url"] = status_url
+        if events_url:
+            local_task.metadata["remote_events_url"] = events_url
+        local_task.updated_at = time.time()
+
+        logger.debug(
+            "A2A delegation submit tracking updated: local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
+            local_task_id,
+            remote_task_id,
+            status_url,
+            events_url,
+        )
 
     async def _handle_client(
         self,
@@ -334,7 +470,33 @@ class A2AChannel(BaseChannel):
             await self._write_json(writer, 400, {"ok": False, "error": "missing envelope"})
             return
 
-        task_id = uuid.uuid4().hex[:12]
+        envelope_task_id = envelope.get("task_id")
+        if isinstance(envelope_task_id, str) and envelope_task_id.strip():
+            task_id = envelope_task_id.strip()
+        else:
+            task_id = uuid.uuid4().hex[:12]
+
+        stream_url = f"{self.config.events_prefix}/{task_id}"
+
+        if task_id in self._tasks:
+            logger.debug(
+                "A2A async submit deduplicated: task_id='{}' from_agent='{}' to_agent='{}'",
+                task_id,
+                envelope.get("from_agent"),
+                envelope.get("to_agent"),
+            )
+            await self._write_json(
+                writer,
+                202,
+                {
+                    "ok": True,
+                    "task_id": task_id,
+                    "status_url": f"{self.config.tasks_prefix}/{task_id}",
+                    "events_url": stream_url,
+                },
+            )
+            return
+
         now = time.time()
         task = A2ATask(
             task_id=task_id,
@@ -344,13 +506,19 @@ class A2AChannel(BaseChannel):
             envelope=envelope,
         )
         self._tasks[task_id] = task
+        logger.debug(
+            "A2A async task created: task_id='{}' from_agent='{}' to_agent='{}' mode='{}'",
+            task_id,
+            envelope.get("from_agent"),
+            envelope.get("to_agent"),
+            envelope.get("mode"),
+        )
         self._task_watchers.setdefault(task_id, set())
 
         worker = asyncio.create_task(self._run_async_task(task_id))
         self._task_workers[task_id] = worker
         worker.add_done_callback(lambda _fut, tid=task_id: self._task_workers.pop(tid, None))
 
-        stream_url = f"{self.config.events_prefix}/{task_id}"
         await self._write_json(
             writer,
             202,

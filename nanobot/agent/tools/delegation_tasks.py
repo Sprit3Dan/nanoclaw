@@ -120,4 +120,3 @@ class DelegationTasksTool(Tool):
         if include_metadata:
             item["metadata"] = dict(task.metadata or {})
         return item
-

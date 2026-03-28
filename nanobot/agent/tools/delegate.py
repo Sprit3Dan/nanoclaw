@@ -1,18 +1,16 @@
-"""Delegate task tool: register-once + VectorDNS SRV resolution + A2A dispatch."""
+"""Delegate task tool: discovery-only routing + A2A dispatch."""
 
 from __future__ import annotations
 
 import asyncio
 import os
-import random
-import socket
-import struct
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 import httpx
+from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.delegation import DelegationTaskMap
@@ -28,37 +26,21 @@ class _ResolvedRoute:
 
 
 class DelegateTaskTool(Tool):
-    """Delegate a task to another agent over A2A using VectorDNS SRV lookup."""
+    """
+    Delegate a task to another agent over A2A using discovery service responses only.
+    """
 
     def __init__(
         self,
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         delegation_queue: DelegationTaskMap | None = None,
         *,
-        default_vectordns_domain: str | None = None,
-        default_vectordns_resolver: str | None = None,
-        default_vectordns_port: int = 53,
-        default_vectordns_timeout_ms: int = 1500,
         agent_id: str | None = None,
         listen_host: str | None = None,
         listen_port: int = 19100,
     ):
         self._send_callback = send_callback
         self._delegation_queue = delegation_queue
-
-        self._default_domain = (
-            default_vectordns_domain
-            or os.environ.get("NANOBOT_VECTORDNS_DOMAIN", "botfactory.svc.cluster.local")
-        )
-        self._default_resolver = (
-            default_vectordns_resolver or os.environ.get("NANOBOT_VECTORDNS_RESOLVER", "127.0.0.1")
-        )
-        self._default_dns_port = int(
-            os.environ.get("NANOBOT_VECTORDNS_PORT", str(default_vectordns_port))
-        )
-        self._default_timeout_ms = int(
-            os.environ.get("NANOBOT_VECTORDNS_TIMEOUT_MS", str(default_vectordns_timeout_ms))
-        )
 
         self._agent_id = agent_id or os.environ.get("NANOBOT_A2A_AGENT_ID", "agent")
         self._listen_host = listen_host or os.environ.get("NANOBOT_A2A_LISTEN_HOST", "0.0.0.0")
@@ -76,7 +58,7 @@ class DelegateTaskTool(Tool):
     def description(self) -> str:
         return (
             "Delegate a task to another agent over A2A. "
-            "Always uses VectorDNS SRV resolution. Default mode is push."
+            "Route resolution is performed only via discovery service responses."
         )
 
     @property
@@ -89,10 +71,9 @@ class DelegateTaskTool(Tool):
                     "description": "Task content to send to another agent.",
                     "minLength": 1,
                 },
-
                 "target_agent": {
                     "type": "string",
-                    "description": "Optional explicit agent id. If omitted, semantic/default SRV name is used.",
+                    "description": "Optional explicit target agent id for discovery.",
                 },
                 "mode": {
                     "type": "string",
@@ -107,44 +88,9 @@ class DelegateTaskTool(Tool):
                     "type": "object",
                     "description": "Optional extra metadata merged into outbound message metadata.",
                 },
-                "vectordns_domain": {
-                    "type": "string",
-                    "description": "VectorDNS zone/domain.",
-                },
-                "vectordns_resolver": {
-                    "type": "string",
-                    "description": "DNS resolver address for VectorDNS queries.",
-                },
-                "vectordns_port": {
-                    "type": "integer",
-                    "description": "DNS resolver port.",
-                    "minimum": 1,
-                    "maximum": 65535,
-                },
-                "vectordns_timeout_ms": {
-                    "type": "integer",
-                    "description": "DNS timeout in milliseconds.",
-                    "minimum": 50,
-                    "maximum": 30000,
-                },
-                "vectordns_name": {
-                    "type": "string",
-                    "description": (
-                        "Optional fully-qualified SRV owner name override "
-                        "(example: _a2a._tcp.researcher.botfactory.svc.cluster.local)."
-                    ),
-                },
                 "await_result": {
                     "type": "boolean",
                     "description": "Compatibility flag. Current implementation is fire-and-ack only.",
-                },
-                "origin_channel": {
-                    "type": "string",
-                    "description": "Optional source channel for upstream response routing (e.g., telegram, discord).",
-                },
-                "origin_chat_id": {
-                    "type": "string",
-                    "description": "Optional source chat id for upstream response routing.",
                 },
             },
             "required": ["task"],
@@ -159,20 +105,24 @@ class DelegateTaskTool(Tool):
         if not task:
             return "Error: task must be non-empty."
 
-        discovery_base_url = str(
-            os.environ.get("NANOBOT_DISCOVERY_BASE_URL", "")
-        ).strip()
-        discovery_register_url = (
-            self._register_url_from_base(discovery_base_url)
-            if discovery_base_url
-            else ""
+        logger.debug(
+            "delegate_task.start agent_id={} listen={}:{} task_len={}",
+            self._agent_id,
+            self._listen_host,
+            self._listen_port,
+            len(task),
         )
 
-        if not discovery_register_url:
+        discovery_base_url = self._normalize_discovery_base_url(
+            str(os.environ.get("NANOBOT_DISCOVERY_BASE_URL", "")).strip()
+        )
+        if not discovery_base_url:
             return "Error: NANOBOT_DISCOVERY_BASE_URL is required."
 
         target_agent_raw = kwargs.get("target_agent")
         target_agent = str(target_agent_raw).strip() if isinstance(target_agent_raw, str) else None
+        if target_agent == "":
+            target_agent = None
 
         mode_raw = kwargs.get("mode", "push")
         mode_l = str(mode_raw or "push").strip().lower()
@@ -181,44 +131,16 @@ class DelegateTaskTool(Tool):
 
         intent_raw = kwargs.get("intent")
         intent = str(intent_raw).strip() if isinstance(intent_raw, str) else None
+        route_intent = (intent or task).strip()
 
         metadata_raw = kwargs.get("metadata")
         metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
 
         origin_channel_raw = kwargs.get("origin_channel")
-        origin_channel = (
-            str(origin_channel_raw).strip()
-            if isinstance(origin_channel_raw, str)
-            else ""
-        )
+        origin_channel = str(origin_channel_raw).strip() if isinstance(origin_channel_raw, str) else ""
 
         origin_chat_id_raw = kwargs.get("origin_chat_id")
-        origin_chat_id = (
-            str(origin_chat_id_raw).strip()
-            if isinstance(origin_chat_id_raw, str)
-            else ""
-        )
-
-        vectordns_domain_raw = kwargs.get("vectordns_domain")
-        vectordns_domain = (
-            str(vectordns_domain_raw).strip()
-            if isinstance(vectordns_domain_raw, str)
-            else None
-        )
-
-        vectordns_resolver_raw = kwargs.get("vectordns_resolver")
-        vectordns_resolver = (
-            str(vectordns_resolver_raw).strip()
-            if isinstance(vectordns_resolver_raw, str)
-            else None
-        )
-
-        vectordns_name_raw = kwargs.get("vectordns_name")
-        vectordns_name = (
-            str(vectordns_name_raw).strip()
-            if isinstance(vectordns_name_raw, str)
-            else None
-        )
+        origin_chat_id = str(origin_chat_id_raw).strip() if isinstance(origin_chat_id_raw, str) else ""
 
         await_result_raw = kwargs.get("await_result", False)
         await_result = (
@@ -227,50 +149,43 @@ class DelegateTaskTool(Tool):
             else str(await_result_raw).strip().lower() in {"1", "true", "yes"}
         )
 
-        def _to_int(value: Any, default: int) -> int:
-            try:
-                if value is None:
-                    return default
-                return int(value)
-            except Exception:
-                return default
+        register_url = self._register_url_from_base(discovery_base_url)
+        logger.debug(
+            "delegate_task.register.begin register_url={} target_agent={} mode={} upstream={}:{}",
+            register_url,
+            target_agent or "",
+            mode_l,
+            origin_channel,
+            origin_chat_id,
+        )
+        await self._register_once(discovery_register_url=register_url)
+        logger.debug("delegate_task.register.ok register_url={}", register_url)
 
-        domain = (vectordns_domain or self._default_domain).strip().strip(".")
-        resolver = (vectordns_resolver or self._default_resolver).strip()
-        dns_port = _to_int(kwargs.get("vectordns_port"), self._default_dns_port)
-        timeout_ms = _to_int(kwargs.get("vectordns_timeout_ms"), self._default_timeout_ms)
-        route_intent = (intent or task).strip()
-
-        await self._register_once(discovery_register_url=discovery_register_url)
-
-        owner_name = self._build_srv_owner_name(
+        route = await self._resolve_http_discover(
+            discovery_base_url=discovery_base_url,
+            task=task,
+            intent=route_intent,
             target_agent=target_agent,
-            domain=domain,
-            owner_override=vectordns_name,
-        )
-
-        route = await self._resolve_vectordns_srv(
-            owner_name=owner_name,
-            resolver=resolver,
-            port=dns_port,
-            timeout_ms=timeout_ms,
         )
         if route is None:
-            route = await self._resolve_http_discover(
-                discovery_register_url=discovery_register_url,
-                task=task,
-                intent=route_intent,
-                target_agent=target_agent,
+            logger.debug(
+                "delegate_task.discovery.no_route target_agent={} intent={} discovery_base={}",
+                target_agent or "",
+                route_intent,
+                discovery_base_url,
             )
-        if route is None:
-            return (
-                f"Error: VectorDNS SRV resolution failed for '{owner_name}' "
-                "and HTTP discovery fallback did not return a valid route."
-            )
+            return "Error: discovery did not return a valid A2A route."
 
-        # Keep chat_id semantic as agent id if possible; A2A will use a2a_peer_base route hint directly.
-        chat_id = target_agent or route.agent_id or route.host.split(".", 1)[0]
+        chat_id = target_agent or route.agent_id or self._agent_from_host(route.host) or route.host
         task_id = uuid.uuid4().hex[:12]
+        logger.debug(
+            "delegate_task.discovery.ok task_id={} chat_id={} route_host={} route_port={} route_base={}",
+            task_id,
+            chat_id,
+            route.host,
+            route.port,
+            route.base_url,
+        )
 
         extra = dict(metadata)
         extra["task_id"] = task_id
@@ -279,10 +194,10 @@ class DelegateTaskTool(Tool):
         extra["a2a_peer_base"] = route.base_url
         extra["_delegation"] = {
             "tool": "delegate_task",
+            "resolver": "discovery-http",
             "resolved_host": route.host,
             "resolved_port": route.port,
-            "resolver": resolver,
-            "owner_name": owner_name,
+            "discovery_base_url": discovery_base_url,
         }
 
         if origin_channel:
@@ -312,18 +227,30 @@ class DelegateTaskTool(Tool):
             content=task,
             metadata=extra,
         )
+        logger.debug(
+            "delegate_task.dispatch.begin task_id={} chat_id={} mode={} has_local_task={} has_upstream={}",
+            task_id,
+            chat_id,
+            mode_l,
+            "delegation_task_id" in extra,
+            bool(origin_channel and origin_chat_id),
+        )
         await self._send_callback(msg)
+        logger.debug("delegate_task.dispatch.sent task_id={} chat_id={}", task_id, chat_id)
 
         if await_result:
             return (
                 f"Delegated task {task_id} to {chat_id} via {route.base_url} "
                 f"(mode={mode_l}). await_result=true requested; delivery is queued."
             )
+
         return f"Delegated task {task_id} to {chat_id} via {route.base_url} (mode={mode_l})."
 
     @staticmethod
     def _normalize_discovery_base_url(url: str) -> str:
-        u = url.strip().rstrip("/")
+        u = (url or "").strip().rstrip("/")
+        if not u:
+            return ""
         if u.endswith("/register"):
             return u[: -len("/register")]
         if u.endswith("/discover"):
@@ -336,39 +263,57 @@ class DelegateTaskTool(Tool):
         return f"{base}/register"
 
     @classmethod
-    def _discover_url_from_register(cls, discovery_register_url: str) -> str:
-        base = cls._normalize_discovery_base_url(discovery_register_url)
+    def _discover_url_from_base(cls, discovery_base_url: str) -> str:
+        base = cls._normalize_discovery_base_url(discovery_base_url)
         return f"{base}/discover"
 
     async def _resolve_http_discover(
         self,
         *,
-        discovery_register_url: str,
+        discovery_base_url: str,
         task: str,
         intent: str,
         target_agent: str | None,
     ) -> _ResolvedRoute | None:
-        discover_url = self._discover_url_from_register(discovery_register_url)
+        discover_url = self._discover_url_from_base(discovery_base_url)
         client = await self._ensure_http_client()
 
-        body: dict[str, Any] = {
+        params: dict[str, Any] = {
             "task": task,
             "intent": intent,
         }
         if target_agent:
-            body["target_agent"] = target_agent
+            params["target_agent"] = target_agent
 
+        logger.debug(
+            "delegate_task.discovery.request url={} target_agent={} intent_len={} task_len={}",
+            discover_url,
+            target_agent or "",
+            len(intent),
+            len(task),
+        )
         try:
-            resp = await client.get(discover_url, params=body)
-        except Exception:
+            resp = await client.get(discover_url, params=params)
+        except Exception as exc:
+            logger.debug(
+                "delegate_task.discovery.error url={} error={}",
+                discover_url,
+                exc,
+            )
             return None
 
+        logger.debug(
+            "delegate_task.discovery.response status={} url={}",
+            resp.status_code,
+            discover_url,
+        )
         if resp.status_code >= 400:
             return None
 
         try:
             payload = resp.json()
         except Exception:
+            logger.debug("delegate_task.discovery.invalid_json url={}", discover_url)
             return None
 
         if not isinstance(payload, dict):
@@ -377,10 +322,18 @@ class DelegateTaskTool(Tool):
         route_obj = payload.get("route")
         route = route_obj if isinstance(route_obj, dict) else payload
 
-        base_url_raw = route.get("base_url")
-        host_raw = route.get("host")
-        port_raw = route.get("port")
-        agent_id_raw = route.get("agent_id") or payload.get("agent_id")
+        base_url_raw = (
+            route.get("base_url")
+            or payload.get("base_url")
+            or route.get("advertised_base_url")
+            or route.get("advertisedBaseUrl")
+            or payload.get("advertised_base_url")
+            or payload.get("advertisedBaseUrl")
+        )
+
+        host_raw = route.get("host") or payload.get("host")
+        port_raw = route.get("port") or payload.get("port")
+        agent_id_raw = route.get("agent_id") or payload.get("agent_id") or target_agent
 
         base_url: str | None = None
         host: str | None = None
@@ -394,10 +347,7 @@ class DelegateTaskTool(Tool):
                     base_url = candidate
                     host = u.host
                     parsed_port = u.port
-                    if isinstance(parsed_port, int):
-                        port = parsed_port
-                    else:
-                        port = 443 if u.scheme == "https" else 80
+                    port = int(parsed_port) if isinstance(parsed_port, int) else (443 if u.scheme == "https" else 80)
             except Exception:
                 return None
 
@@ -405,43 +355,52 @@ class DelegateTaskTool(Tool):
             if not isinstance(host_raw, str) or not host_raw.strip():
                 return None
 
-            parsed_port_value: int | None = None
+            parsed_port: int | None = None
             if isinstance(port_raw, int):
-                parsed_port_value = port_raw
+                parsed_port = port_raw
             elif isinstance(port_raw, float):
-                parsed_port_value = int(port_raw)
+                parsed_port = int(port_raw)
             elif isinstance(port_raw, str):
-                raw = port_raw.strip()
-                if raw:
+                raw_port = port_raw.strip()
+                if raw_port:
                     try:
-                        parsed_port_value = int(raw)
+                        parsed_port = int(raw_port)
                     except Exception:
-                        parsed_port_value = None
+                        parsed_port = None
 
-            if parsed_port_value is None or parsed_port_value <= 0:
+            if parsed_port is None or parsed_port <= 0:
                 return None
 
-            port = parsed_port_value
             host = host_raw.strip()
+            port = parsed_port
             base_url = f"http://{host}:{port}"
 
         agent_id: str | None = None
         if isinstance(agent_id_raw, str) and agent_id_raw.strip():
             agent_id = agent_id_raw.strip()
         elif host:
-            agent_id = self._agent_from_target(host)
+            agent_id = self._agent_from_host(host)
 
         if not host or port is None or not base_url:
             return None
 
+        logger.debug(
+            "delegate_task.discovery.route_resolved agent_id={} host={} port={} base_url={}",
+            agent_id or "",
+            host,
+            port,
+            base_url,
+        )
         return _ResolvedRoute(agent_id=agent_id, host=host, port=port, base_url=base_url)
 
     async def _register_once(self, discovery_register_url: str) -> None:
         url = discovery_register_url.strip()
         if not url:
             raise ValueError("discovery_register_url is empty")
+
         async with self._register_lock:
             if url in self._registered_at:
+                logger.debug("delegate_task.register.cached register_url={}", url)
                 return
 
             client = await self._ensure_http_client()
@@ -457,19 +416,44 @@ class DelegateTaskTool(Tool):
                 "capabilities": {
                     "a2a_modes": ["push", "async", "sse"],
                     "default_mode": "push",
-                    "semantic_routing": "vectordns-srv",
+                    "semantic_routing": "discovery-http",
                 },
             }
+
+            logger.debug(
+                "delegate_task.register.request url={} advertised_base_url={}",
+                url,
+                payload["address"]["base_url"],
+            )
             resp = await client.post(url, json=payload)
             if resp.status_code >= 400:
+                logger.debug(
+                    "delegate_task.register.failed url={} status={} body={}",
+                    url,
+                    resp.status_code,
+                    resp.text[:300],
+                )
                 raise RuntimeError(f"register failed [{resp.status_code}]: {resp.text[:300]}")
+
             self._registered_at[url] = time.time()
+            logger.debug("delegate_task.register.success url={}", url)
 
     def _advertised_base_url(self) -> str | None:
+        # Explicit env override (recommended for Kubernetes service URL registration).
+        env_value = (
+            os.environ.get("NANOBOT_A2A_ADVERTISED_BASE_URL")
+            or os.environ.get("NANOBOT_ADVERTISED_BASE_URL")
+            or ""
+        ).strip()
+        if env_value:
+            normalized = self._normalize_url(env_value)
+            if normalized:
+                return normalized
+
         host = (self._listen_host or "").strip()
         if not host or host in {"0.0.0.0", "::"}:
             return None
-        return f"http://{host}:{self._listen_port}"
+        return self._normalize_url(f"http://{host}:{self._listen_port}")
 
     async def _ensure_http_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
@@ -477,247 +461,24 @@ class DelegateTaskTool(Tool):
         return self._http_client
 
     @staticmethod
-    def _build_srv_owner_name(
-        *,
-        target_agent: str | None,
-        domain: str,
-        owner_override: str | None,
-    ) -> str:
-        if owner_override and owner_override.strip():
-            return owner_override.strip().strip(".")
-        if target_agent:
-            # Convention: _a2a._tcp.<agent>.<zone>
-            return f"_a2a._tcp.{target_agent}.{domain}"
-        # Semantic/default lane managed by VectorDNS policy.
-        return f"_a2a._tcp.{domain}"
-
-    async def _resolve_vectordns_srv(
-        self,
-        *,
-        owner_name: str,
-        resolver: str,
-        port: int,
-        timeout_ms: int,
-    ) -> _ResolvedRoute | None:
-        response = await asyncio.to_thread(
-            self._dns_query_udp,
-            resolver,
-            port,
-            owner_name,
-            33,  # SRV
-            timeout_ms,
-        )
-        if response is None:
+    def _normalize_url(value: str) -> str | None:
+        v = value.strip().rstrip("/")
+        if not v:
             return None
-
-        srv_records = [r for r in response if r["type"] == 33]
-        a_records = [r for r in response if r["type"] == 1]
-
-        if not srv_records:
+        try:
+            u = httpx.URL(v)
+        except Exception:
             return None
-
-        # RFC-ish selection: min priority, then weighted random by weight.
-        min_pri = min(int(r["priority"]) for r in srv_records)
-        bucket = [r for r in srv_records if int(r["priority"]) == min_pri]
-        selected = self._weighted_pick(bucket)
-        if selected is None:
+        if u.scheme not in {"http", "https"} or not u.host:
             return None
-
-        target = str(selected["target"]).rstrip(".")
-        target_port = int(selected["port"])
-
-        # Try additional-section A first, then explicit A lookup.
-        ip = None
-        for rec in a_records:
-            if str(rec.get("name", "")).rstrip(".").lower() == target.lower():
-                ip = str(rec.get("address"))
-                break
-
-        if ip is None:
-            a_resp = await asyncio.to_thread(
-                self._dns_query_udp,
-                resolver,
-                port,
-                target,
-                1,  # A
-                timeout_ms,
-            )
-            if a_resp:
-                for rec in a_resp:
-                    if rec.get("type") == 1 and rec.get("address"):
-                        ip = str(rec["address"])
-                        break
-
-        host = ip or target
-        base_url = f"http://{host}:{target_port}"
-        agent_id = self._agent_from_target(target)
-        return _ResolvedRoute(agent_id=agent_id, host=host, port=target_port, base_url=base_url)
+        return v
 
     @staticmethod
-    def _agent_from_target(target: str) -> str | None:
-        first = target.split(".", 1)[0]
+    def _agent_from_host(host: str) -> str | None:
+        first = host.split(".", 1)[0].strip()
+        if not first:
+            return None
         if first.endswith("-a2a"):
-            return first[: -len("-a2a")]
-        return first or None
-
-    @staticmethod
-    def _weighted_pick(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-        if not records:
-            return None
-        weights = [max(0, int(r.get("weight", 0))) for r in records]
-        total = sum(weights)
-        if total <= 0:
-            return records[0]
-        needle = random.randint(1, total)
-        acc = 0
-        for rec, w in zip(records, weights, strict=False):
-            acc += w
-            if needle <= acc:
-                return rec
-        return records[0]
-
-    @classmethod
-    def _dns_query_udp(
-        cls,
-        resolver: str,
-        port: int,
-        qname: str,
-        qtype: int,
-        timeout_ms: int,
-    ) -> list[dict[str, Any]] | None:
-        qid = random.randint(0, 0xFFFF)
-        packet = cls._build_dns_query(qid=qid, qname=qname, qtype=qtype)
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.settimeout(max(0.05, timeout_ms / 1000.0))
-            sock.sendto(packet, (resolver, int(port)))
-            data, _ = sock.recvfrom(4096)
-        except Exception:
-            return None
-        finally:
-            sock.close()
-
-        try:
-            return cls._parse_dns_response(data, expected_id=qid)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _encode_qname(name: str) -> bytes:
-        out = bytearray()
-        for label in name.strip(".").split("."):
-            raw = label.encode("utf-8")
-            if len(raw) > 63:
-                raise ValueError("label too long")
-            out.append(len(raw))
-            out.extend(raw)
-        out.append(0)
-        return bytes(out)
-
-    @classmethod
-    def _build_dns_query(cls, *, qid: int, qname: str, qtype: int) -> bytes:
-        # Header: ID, flags(RD), QDCOUNT=1, AN=NS=AR=0
-        header = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
-        question = cls._encode_qname(qname) + struct.pack("!HH", qtype, 1)
-        return header + question
-
-    @classmethod
-    def _parse_dns_response(cls, data: bytes, *, expected_id: int) -> list[dict[str, Any]]:
-        if len(data) < 12:
-            return []
-
-        qid, flags, qdcount, ancount, nscount, arcount = struct.unpack("!HHHHHH", data[:12])
-        if qid != expected_id:
-            return []
-        rcode = flags & 0x000F
-        if rcode != 0:
-            return []
-
-        offset = 12
-        for _ in range(qdcount):
-            _, offset = cls._read_name(data, offset)
-            offset += 4  # qtype + qclass
-
-        total_rr = ancount + nscount + arcount
-        out: list[dict[str, Any]] = []
-
-        for _ in range(total_rr):
-            rr_name, offset = cls._read_name(data, offset)
-            if offset + 10 > len(data):
-                break
-            rtype, rclass, _ttl, rdlen = struct.unpack("!HHIH", data[offset : offset + 10])
-            offset += 10
-            rdata_end = offset + rdlen
-            if rdata_end > len(data):
-                break
-            rdata = data[offset:rdata_end]
-            offset = rdata_end
-
-            if rclass != 1:
-                continue
-
-            if rtype == 33 and len(rdata) >= 6:  # SRV
-                priority, weight, port = struct.unpack("!HHH", rdata[:6])
-                target, _ = cls._read_name(data, rdata_end - rdlen + 6)
-                out.append(
-                    {
-                        "type": 33,
-                        "name": rr_name,
-                        "priority": priority,
-                        "weight": weight,
-                        "port": port,
-                        "target": target.rstrip("."),
-                    }
-                )
-            elif rtype == 1 and len(rdata) == 4:  # A
-                out.append(
-                    {
-                        "type": 1,
-                        "name": rr_name,
-                        "address": socket.inet_ntoa(rdata),
-                    }
-                )
-
-        return out
-
-    @classmethod
-    def _read_name(cls, data: bytes, offset: int) -> tuple[str, int]:
-        labels: list[str] = []
-        jumped = False
-        start = offset
-        seen = set()
-
-        while True:
-            if offset >= len(data):
-                break
-            if offset in seen:
-                break
-            seen.add(offset)
-
-            length = data[offset]
-            if length == 0:
-                offset += 1
-                break
-
-            # Compression pointer
-            if (length & 0xC0) == 0xC0:
-                if offset + 1 >= len(data):
-                    break
-                ptr = ((length & 0x3F) << 8) | data[offset + 1]
-                if not jumped:
-                    start = offset + 2
-                offset = ptr
-                jumped = True
-                continue
-
-            offset += 1
-            end = offset + length
-            if end > len(data):
-                break
-            labels.append(data[offset:end].decode("utf-8", errors="ignore"))
-            offset = end
-
-        name = ".".join(labels)
-        return (name, start if jumped else offset)
+            return first[: -len("-a2a")] or None
+        return first
 
