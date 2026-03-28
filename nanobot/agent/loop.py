@@ -856,8 +856,16 @@ class AgentLoop:
                 else ""
             )
             if upstream_channel and upstream_chat_id:
-                tool_channel = upstream_channel
-                tool_chat_id = upstream_chat_id
+                upstream_channel_enabled = False
+                if self.channels_config is not None:
+                    section = getattr(self.channels_config, upstream_channel, None)
+                    if isinstance(section, dict):
+                        upstream_channel_enabled = bool(section.get("enabled", False))
+                    elif section is not None:
+                        upstream_channel_enabled = bool(getattr(section, "enabled", False))
+                if upstream_channel_enabled:
+                    tool_channel = upstream_channel
+                    tool_chat_id = upstream_chat_id
 
         self._set_tool_context(tool_channel, tool_chat_id, msg_meta.get("message_id"))
         if message_tool := self.tools.get("message"):
