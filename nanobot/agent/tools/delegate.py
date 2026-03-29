@@ -49,6 +49,13 @@ class DelegateTaskTool(Tool):
         self._register_lock = asyncio.Lock()
         self._registered_at: dict[str, float] = {}
         self._http_client: httpx.AsyncClient | None = None
+        self._origin_channel: str = ""
+        self._origin_chat_id: str = ""
+
+    def set_context(self, origin_channel: str, origin_chat_id: str) -> None:
+        """Set default origin routing context for delegation calls."""
+        self._origin_channel = str(origin_channel or "").strip()
+        self._origin_chat_id = str(origin_chat_id or "").strip()
 
     @property
     def name(self) -> str:
@@ -74,23 +81,6 @@ class DelegateTaskTool(Tool):
                 "target_agent": {
                     "type": "string",
                     "description": "Optional explicit target agent id for discovery.",
-                },
-                "mode": {
-                    "type": "string",
-                    "description": "A2A send mode. Defaults to push.",
-                    "enum": ["push", "async", "sse"],
-                },
-                "intent": {
-                    "type": "string",
-                    "description": "Optional routing intent. Defaults to task text.",
-                },
-                "metadata": {
-                    "type": "object",
-                    "description": "Optional extra metadata merged into outbound message metadata.",
-                },
-                "await_result": {
-                    "type": "boolean",
-                    "description": "Compatibility flag. Current implementation is fire-and-ack only.",
                 },
             },
             "required": ["task"],
@@ -133,21 +123,27 @@ class DelegateTaskTool(Tool):
         intent = str(intent_raw).strip() if isinstance(intent_raw, str) else None
         route_intent = (intent or task).strip()
 
-        metadata_raw = kwargs.get("metadata")
-        metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
-
-        origin_channel_raw = kwargs.get("origin_channel")
-        origin_channel = str(origin_channel_raw).strip() if isinstance(origin_channel_raw, str) else ""
-
-        origin_chat_id_raw = kwargs.get("origin_chat_id")
-        origin_chat_id = str(origin_chat_id_raw).strip() if isinstance(origin_chat_id_raw, str) else ""
-
-        await_result_raw = kwargs.get("await_result", False)
-        await_result = (
-            await_result_raw
-            if isinstance(await_result_raw, bool)
-            else str(await_result_raw).strip().lower() in {"1", "true", "yes"}
+        origin_channel_raw = kwargs.get("origin_channel", self._origin_channel)
+        origin_channel = (
+            str(origin_channel_raw).strip()
+            if isinstance(origin_channel_raw, str)
+            else self._origin_channel
         )
+        if not origin_channel:
+            origin_channel = self._origin_channel
+
+        origin_chat_id_raw = kwargs.get("origin_chat_id", self._origin_chat_id)
+        origin_chat_id = (
+            str(origin_chat_id_raw).strip()
+            if isinstance(origin_chat_id_raw, str)
+            else self._origin_chat_id
+        )
+        if not origin_chat_id:
+            origin_chat_id = self._origin_chat_id
+
+        # Keep contract explicit but auto-generated to minimize tool-call parameters.
+        message_type = "delegation_request"
+        correlation_id = uuid.uuid4().hex
 
         register_url = self._register_url_from_base(discovery_base_url)
         logger.debug(
@@ -187,28 +183,24 @@ class DelegateTaskTool(Tool):
             route.base_url,
         )
 
-        extra = dict(metadata)
-        extra["task_id"] = task_id
-        extra["intent"] = route_intent
-        extra["a2a_mode"] = mode_l
-        extra["a2a_peer_base"] = route.base_url
-        extra["_delegation"] = {
-            "tool": "delegate_task",
-            "resolver": "discovery-http",
-            "resolved_host": route.host,
-            "resolved_port": route.port,
-            "discovery_base_url": discovery_base_url,
+        extra = {
+            "message_type": message_type,
+            "correlation_id": correlation_id,
+            "a2a_peer_base": route.base_url,
         }
 
         if origin_channel:
-            extra.setdefault("upstream_channel", origin_channel)
+            extra["upstream_channel"] = origin_channel
         if origin_chat_id:
-            extra.setdefault("upstream_chat_id", origin_chat_id)
+            extra["upstream_chat_id"] = origin_chat_id
 
-        if self._delegation_queue and origin_channel and origin_chat_id:
-            local_task = self._delegation_queue.create(
+        local_delegation_bound = False
+        delegation_queue = self._delegation_queue
+        if delegation_queue and origin_channel and origin_chat_id:
+            delegation_queue.create(
                 reply_channel=origin_channel,
                 reply_chat_id=origin_chat_id,
+                correlation_id=correlation_id,
                 origin_channel=origin_channel,
                 origin_chat_id=origin_chat_id,
                 delegated_channel="a2a",
@@ -216,20 +208,18 @@ class DelegateTaskTool(Tool):
                     "initial_request": {
                         "task": task,
                         "target_agent": target_agent,
-                        "intent": route_intent,
-                        "mode": mode_l,
                         "origin_channel": origin_channel,
                         "origin_chat_id": origin_chat_id,
+                        "correlation_id": correlation_id,
                     },
                 },
             )
-            self._delegation_queue.bind_delegated_task_id(
-                delegation_task_id=local_task.id,
+            delegation_queue.bind_remote_task_id(
+                correlation_id=correlation_id,
                 delegated_task_id=task_id,
                 delegated_agent_id=chat_id,
             )
-            extra["delegation_task_id"] = local_task.id
-            extra["_delegation"]["delegation_task_id"] = local_task.id
+            local_delegation_bound = True
 
         msg = OutboundMessage(
             channel="a2a",
@@ -242,19 +232,16 @@ class DelegateTaskTool(Tool):
             task_id,
             chat_id,
             mode_l,
-            "delegation_task_id" in extra,
+            local_delegation_bound,
             bool(origin_channel and origin_chat_id),
         )
         await self._send_callback(msg)
         logger.debug("delegate_task.dispatch.sent task_id={} chat_id={}", task_id, chat_id)
 
-        if await_result:
-            return (
-                f"Delegated task {task_id} to {chat_id} via {route.base_url} "
-                f"(mode={mode_l}). await_result=true requested; delivery is queued."
-            )
-
-        return f"Delegated task {task_id} to {chat_id} via {route.base_url} (mode={mode_l})."
+        return (
+            f"Delegated task {task_id} to {chat_id} via {route.base_url} "
+            f"(mode={mode_l}, message_type={message_type}, correlation_id={correlation_id})."
+        )
 
     @staticmethod
     def _normalize_discovery_base_url(url: str) -> str:

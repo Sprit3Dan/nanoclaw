@@ -27,11 +27,13 @@ class DelegationTask:
     reply_channel: str
     reply_chat_id: str
 
+    # Delegation contract details.
+    correlation_id: str
+
     # Optional source/origin context that created this delegation.
     origin_channel: str = ""
     origin_chat_id: str = ""
 
-    # Delegation transport details.
     delegated_channel: str = "a2a"
     delegated_task_id: str | None = None
     delegated_agent_id: str | None = None
@@ -53,11 +55,11 @@ class DelegationTaskMap:
 
     This is key-based correlation storage, not FIFO queue semantics.
     It supports multiple concurrent A2A delegations and out-of-order replies:
-    if a matching delegated task id is present, it is resolved and routed.
+    if a matching correlation id is present, it is resolved and routed.
 
     Typical flow:
-    1) create() when delegation path is chosen (capture reply target)
-    2) bind_delegated_task_id() after outbound delegation is accepted
+    1) create() with a required correlation_id (capture reply target)
+    2) bind_remote_task_id() after outbound delegation is accepted
     3) resolve_reply_target() on inbound A2A response
     4) mark_completed() after forwarding response to the customer channel
     """
@@ -65,7 +67,7 @@ class DelegationTaskMap:
     def __init__(self) -> None:
         self._lock = RLock()
         self._tasks: dict[str, DelegationTask] = {}
-        self._by_delegated_task_id: dict[str, str] = {}
+        self._by_correlation_id: dict[str, str] = {}
         raw_audit_path = os.environ.get("NANOBOT_DELEGATION_AUDIT_JSONL", "memory/delegation_tasks.jsonl")
         self._audit_path = Path(raw_audit_path).expanduser()
 
@@ -74,18 +76,24 @@ class DelegationTaskMap:
         *,
         reply_channel: str,
         reply_chat_id: str,
+        correlation_id: str,
         origin_channel: str = "",
         origin_chat_id: str = "",
         delegated_channel: str = "a2a",
         metadata: Mapping[str, Any] | None = None,
     ) -> DelegationTask:
         now = time.time()
+        correlation = str(correlation_id).strip()
+        if not correlation:
+            raise ValueError("correlation_id is required")
+
         task = DelegationTask(
             id=self._new_id(),
             created_at=now,
             updated_at=now,
             reply_channel=str(reply_channel).strip(),
             reply_chat_id=str(reply_chat_id).strip(),
+            correlation_id=correlation,
             origin_channel=str(origin_channel).strip(),
             origin_chat_id=str(origin_chat_id).strip(),
             delegated_channel=str(delegated_channel).strip() or "a2a",
@@ -94,10 +102,12 @@ class DelegationTaskMap:
 
         with self._lock:
             self._tasks[task.id] = task
+            self._by_correlation_id[task.correlation_id] = task.id
 
         logger.debug(
-            "delegation.create local_id={} reply={}#{} origin={}#{} delegated_channel={}",
+            "delegation.create local_id={} correlation_id={} reply={}#{} origin={}#{} delegated_channel={}",
             task.id,
+            task.correlation_id,
             task.reply_channel,
             task.reply_chat_id,
             task.origin_channel,
@@ -113,6 +123,7 @@ class DelegationTaskMap:
                 "origin_channel": task.origin_channel,
                 "origin_chat_id": task.origin_chat_id,
                 "delegated_channel": task.delegated_channel,
+                "correlation_id": task.correlation_id,
             },
         )
         return task
@@ -121,29 +132,34 @@ class DelegationTaskMap:
         with self._lock:
             return self._tasks.get(str(delegation_task_id).strip())
 
-    def bind_delegated_task_id(
+    def bind_remote_task_id(
         self,
         *,
-        delegation_task_id: str,
+        correlation_id: str,
         delegated_task_id: str,
         delegated_agent_id: str | None = None,
     ) -> bool:
-        """Attach downstream delegated task id to an existing delegation task."""
-        local_id = str(delegation_task_id).strip()
+        """Attach downstream remote task details to an existing correlation-tracked delegation task."""
+        corr = str(correlation_id).strip()
         remote_id = str(delegated_task_id).strip()
-        if not local_id or not remote_id:
+        if not corr or not remote_id:
             logger.debug(
-                "delegation.bind skipped invalid ids local_id='{}' remote_id='{}'",
-                local_id,
+                "delegation.bind_remote skipped invalid values correlation_id='{}' remote_id='{}'",
+                corr,
                 remote_id,
             )
             return False
 
         with self._lock:
+            local_id = self._by_correlation_id.get(corr)
+            if not local_id:
+                logger.debug("delegation.bind_remote skipped correlation_id={} reason=not_found", corr)
+                return False
+
             task = self._tasks.get(local_id)
             if task is None or not task.is_active():
                 logger.debug(
-                    "delegation.bind skipped local_id={} reason={}",
+                    "delegation.bind_remote skipped local_id={} reason={}",
                     local_id,
                     "not_found" if task is None else f"inactive:{task.status}",
                 )
@@ -154,18 +170,20 @@ class DelegationTaskMap:
                 task.delegated_agent_id = str(delegated_agent_id).strip() or None
             task.status = "dispatched"
             task.updated_at = time.time()
-            self._by_delegated_task_id[remote_id] = task.id
+
             logger.debug(
-                "delegation.bind local_id={} remote_id={} remote_agent_id={} status={}",
+                "delegation.bind_remote local_id={} correlation_id={} remote_id={} remote_agent_id={} status={}",
                 task.id,
+                task.correlation_id,
                 remote_id,
                 task.delegated_agent_id,
                 task.status,
             )
             self._append_audit_event(
-                "bind_delegated_task_id",
+                "bind_remote_task_id",
                 task,
                 extra={
+                    "correlation_id": task.correlation_id,
                     "delegated_task_id": remote_id,
                     "delegated_agent_id": task.delegated_agent_id,
                 },
@@ -176,25 +194,25 @@ class DelegationTaskMap:
         """
         Resolve active delegation task from inbound metadata.
 
-        Lookup is id-based and order-independent, so out-of-order A2A replies
-        are handled correctly whenever a matching task id is available.
-        Supports common task id keys used by A2A envelopes/metadata.
+        Lookup is correlation-based and order-independent, so out-of-order A2A replies
+        are handled correctly whenever a matching correlation id is available.
+        Supports correlation_id across top-level, `_a2a`, and `_delegation` metadata.
         """
-        candidates = self._extract_task_id_candidates(metadata)
+        candidates = self._extract_correlation_candidates(metadata)
         if not candidates:
-            logger.debug("delegation.resolve no task-id candidates in metadata")
+            logger.debug("delegation.resolve no correlation-id candidates in metadata")
             return None
 
         with self._lock:
-            for remote_id in candidates:
-                local_id = self._by_delegated_task_id.get(remote_id)
+            for correlation_id in candidates:
+                local_id = self._by_correlation_id.get(correlation_id)
                 if not local_id:
                     continue
                 task = self._tasks.get(local_id)
                 if task and task.is_active():
                     logger.debug(
-                        "delegation.resolve matched remote_id={} -> local_id={} status={}",
-                        remote_id,
+                        "delegation.resolve matched correlation_id={} -> local_id={} status={}",
+                        correlation_id,
                         task.id,
                         task.status,
                     )
@@ -230,8 +248,7 @@ class DelegationTaskMap:
             task.status = "completed"
             task.completed_at = time.time()
             task.updated_at = task.completed_at
-            if task.delegated_task_id:
-                self._by_delegated_task_id.pop(task.delegated_task_id, None)
+            self._by_correlation_id.pop(task.correlation_id, None)
             logger.debug(
                 "delegation.complete local_id={} remote_id={} completed_at={}",
                 task.id,
@@ -259,8 +276,7 @@ class DelegationTaskMap:
                     continue
                 task.status = "expired"
                 task.updated_at = time.time()
-                if task.delegated_task_id:
-                    self._by_delegated_task_id.pop(task.delegated_task_id, None)
+                self._by_correlation_id.pop(task.correlation_id, None)
                 expired += 1
                 logger.debug(
                     "delegation.expire local_id={} remote_id={} ttl_s={}",
@@ -295,6 +311,7 @@ class DelegationTaskMap:
             "status": task.status,
             "reply_channel": task.reply_channel,
             "reply_chat_id": task.reply_chat_id,
+            "correlation_id": task.correlation_id,
             "origin_channel": task.origin_channel,
             "origin_chat_id": task.origin_chat_id,
             "delegated_channel": task.delegated_channel,
@@ -321,7 +338,7 @@ class DelegationTaskMap:
         return uuid.uuid4().hex[:12]
 
     @staticmethod
-    def _extract_task_id_candidates(metadata: Mapping[str, Any] | None) -> list[str]:
+    def _extract_correlation_candidates(metadata: Mapping[str, Any] | None) -> list[str]:
         if not isinstance(metadata, Mapping):
             return []
 
@@ -333,18 +350,15 @@ class DelegationTaskMap:
                 if v and v not in out:
                     out.append(v)
 
-        add(metadata.get("delegated_task_id"))
-        add(metadata.get("task_id"))
-        add(metadata.get("a2a_task_id"))
+        add(metadata.get("correlation_id"))
 
         raw_a2a = metadata.get("_a2a")
         if isinstance(raw_a2a, Mapping):
-            add(raw_a2a.get("task_id"))
+            add(raw_a2a.get("correlation_id"))
 
         raw_delegation = metadata.get("_delegation")
         if isinstance(raw_delegation, Mapping):
-            add(raw_delegation.get("delegated_task_id"))
-            add(raw_delegation.get("task_id"))
+            add(raw_delegation.get("correlation_id"))
 
         return out
 

@@ -155,6 +155,7 @@ class DelegationRemoteStatusTool(Tool):
             "age_seconds": max(0, int(time.time() - task.created_at)),
             "reply_channel": task.reply_channel,
             "reply_chat_id": task.reply_chat_id,
+            "correlation_id": task.correlation_id,
             "origin_channel": task.origin_channel,
             "origin_chat_id": task.origin_chat_id,
             "delegated_channel": task.delegated_channel,

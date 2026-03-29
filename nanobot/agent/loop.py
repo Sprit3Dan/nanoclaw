@@ -10,13 +10,14 @@ import sys
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, Protocol, cast, runtime_checkable
 
 from loguru import logger
 
 from nanobot import __version__
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.routing.delegation_router import DelegationRouter
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -38,6 +39,12 @@ from nanobot.session.manager import Session, SessionManager
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RoutingConfig, WebSearchConfig
     from nanobot.cron.service import CronService
+
+
+@runtime_checkable
+class _ContextAwareTool(Protocol):
+    def set_context(self, channel: str, chat_id: str, *args: Any) -> None:
+        ...
 
 
 class AgentLoop:
@@ -139,6 +146,10 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
         )
+        self.delegation_router = DelegationRouter(
+            delegation_map=self.bus.delegation_map,
+            channels_config=self.channels_config,
+        )
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -192,32 +203,21 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        self._current_origin_channel = channel
-        self._current_origin_chat_id = chat_id
 
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+                if isinstance(tool, _ContextAwareTool):
+                    ctx_tool = cast(_ContextAwareTool, tool)
+                    ctx_tool.set_context(
+                        channel,
+                        chat_id,
+                        *([message_id] if name == "message" else []),
+                    )
 
-        # Ensure delegate_task always receives inbound origin context unless explicitly overridden.
+        # Delegate tool uses explicit context injection (no execute monkey-patching).
         if delegate_tool := self.tools.get("delegate_task"):
-            if not getattr(delegate_tool, "_origin_ctx_wrapped", False):
-                original_execute = delegate_tool.execute
-
-                async def _execute_with_origin(**kwargs: Any) -> Any:
-                    kwargs.setdefault(
-                        "origin_channel",
-                        getattr(self, "_current_origin_channel", ""),
-                    )
-                    kwargs.setdefault(
-                        "origin_chat_id",
-                        getattr(self, "_current_origin_chat_id", ""),
-                    )
-                    return await original_execute(**kwargs)
-
-                delegate_tool.execute = _execute_with_origin  # type: ignore[method-assign]
-                delegate_tool._origin_ctx_wrapped = True  # type: ignore[attr-defined]
+            if isinstance(delegate_tool, DelegateTaskTool):
+                delegate_tool.set_context(channel, chat_id)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -839,34 +839,8 @@ class AgentLoop:
             )
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
-        tool_channel = msg.channel
-        tool_chat_id = msg.chat_id
         msg_meta = msg.metadata or {}
-
-        if msg.channel == "a2a":
-            upstream_channel_raw = msg_meta.get("upstream_channel")
-            upstream_chat_id_raw = msg_meta.get("upstream_chat_id")
-            upstream_channel = (
-                str(upstream_channel_raw).strip()
-                if isinstance(upstream_channel_raw, str)
-                else ""
-            )
-            upstream_chat_id = (
-                str(upstream_chat_id_raw).strip()
-                if isinstance(upstream_chat_id_raw, str)
-                else ""
-            )
-            if upstream_channel and upstream_chat_id:
-                upstream_channel_enabled = False
-                if self.channels_config is not None:
-                    section = getattr(self.channels_config, upstream_channel, None)
-                    if isinstance(section, dict):
-                        upstream_channel_enabled = bool(section.get("enabled", False))
-                    elif section is not None:
-                        upstream_channel_enabled = bool(getattr(section, "enabled", False))
-                if upstream_channel_enabled:
-                    tool_channel = upstream_channel
-                    tool_chat_id = upstream_chat_id
+        tool_channel, tool_chat_id = self.delegation_router.resolve_tool_target(msg)
 
         self._set_tool_context(tool_channel, tool_chat_id, msg_meta.get("message_id"))
         if message_tool := self.tools.get("message"):
@@ -912,68 +886,9 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         response_metadata = dict(msg.metadata or {})
-        if msg.channel == "a2a":
-            # Correlate by delegated task id via direct map lookup (order-independent).
-            active_delegation = self.bus.delegation.resolve(response_metadata)
-            if active_delegation is not None:
-                reply_channel = active_delegation.reply_channel
-                reply_chat_id = active_delegation.reply_chat_id
-                if reply_channel and reply_chat_id:
-                    self.bus.delegation.mark_completed(active_delegation.id)
-                    return OutboundMessage(
-                        channel=reply_channel,
-                        chat_id=reply_chat_id,
-                        content=final_content,
-                        metadata=response_metadata,
-                    )
-
-            upstream_channel_raw = response_metadata.get("upstream_channel")
-            upstream_chat_id_raw = response_metadata.get("upstream_chat_id")
-            upstream_channel = (
-                str(upstream_channel_raw).strip()
-                if isinstance(upstream_channel_raw, str)
-                else ""
-            )
-            upstream_chat_id = (
-                str(upstream_chat_id_raw).strip()
-                if isinstance(upstream_chat_id_raw, str)
-                else ""
-            )
-
-            upstream_channel_enabled = False
-            if upstream_channel and self.channels_config is not None:
-                section = getattr(self.channels_config, upstream_channel, None)
-                if isinstance(section, dict):
-                    upstream_channel_enabled = bool(section.get("enabled", False))
-                elif section is not None:
-                    upstream_channel_enabled = bool(getattr(section, "enabled", False))
-
-            # If delegation carried original user routing info and that channel is enabled here, respond there directly.
-            if upstream_channel and upstream_chat_id and upstream_channel_enabled:
-                return OutboundMessage(
-                    channel=upstream_channel,
-                    chat_id=upstream_chat_id,
-                    content=final_content,
-                    metadata=response_metadata,
-                )
-
-            # Fallback: reply over A2A to sender of the inbound envelope.
-            raw_a2a = response_metadata.get("_a2a")
-            a2a_ctx = raw_a2a if isinstance(raw_a2a, dict) else {}
-            origin_agent = str(a2a_ctx.get("from_agent") or msg.sender_id).strip() or str(msg.sender_id)
-            reply_to_base = a2a_ctx.get("reply_to_base")
-            if isinstance(reply_to_base, str) and reply_to_base.strip():
-                response_metadata["a2a_peer_base"] = reply_to_base.strip()
-
-            return OutboundMessage(
-                channel="a2a",
-                chat_id=origin_agent,
-                content=final_content,
-                metadata=response_metadata,
-            )
-
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+        return self.delegation_router.route_response(
+            msg=msg,
+            content=final_content,
             metadata=response_metadata,
         )
 

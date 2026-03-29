@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import time
 import uuid
@@ -17,11 +15,18 @@ from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.channels.a2a_protocol import (
+    A2AEnvelopePolicy,
+    MESSAGE_TYPE_DELEGATION_REQUEST,
+    PROTOCOL,
+    join_url,
+    make_auth,
+    normalize_base_url,
+    should_sign,
+    validate_inbound_envelope,
+)
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
-
-_PROTOCOL = "nanobot-a2a/v1"
-_AUTH_METHOD = "hmac-sha256"
 
 _STATUS_TEXT = {
     200: "OK",
@@ -361,27 +366,41 @@ class A2AChannel(BaseChannel):
             if delegation_meta is not None:
                 delegation_meta["remote_events_url"] = events_url
 
-        local_task_id_raw = metadata.get("delegation_task_id")
-        if not local_task_id_raw and delegation_meta is not None:
-            local_task_id_raw = delegation_meta.get("delegation_task_id")
+        correlation_id_raw = metadata.get("correlation_id")
+        if not correlation_id_raw and delegation_meta is not None:
+            correlation_id_raw = delegation_meta.get("correlation_id")
 
-        local_task_id = (
-            str(local_task_id_raw).strip()
-            if isinstance(local_task_id_raw, str)
+        correlation_id = (
+            str(correlation_id_raw).strip()
+            if isinstance(correlation_id_raw, str)
             else ""
         )
-        if not local_task_id:
+        if not correlation_id:
             logger.debug(
-                "A2A delegation submit tracking skipped: missing local delegation_task_id for remote_task_id='{}'",
+                "A2A delegation submit tracking skipped: missing correlation_id for remote_task_id='{}'",
                 remote_task_id,
             )
             return
 
-        local_task = self.bus.delegation.get(local_task_id)
+        delegated_agent_id_raw = envelope.get("to_agent")
+        delegated_agent_id = (
+            str(delegated_agent_id_raw).strip()
+            if isinstance(delegated_agent_id_raw, str)
+            else None
+        ) or None
+
+        if remote_task_id:
+            self.bus.delegation.bind_remote_task_id(
+                correlation_id=correlation_id,
+                delegated_task_id=remote_task_id,
+                delegated_agent_id=delegated_agent_id,
+            )
+
+        local_task = self.bus.delegation.resolve({"correlation_id": correlation_id})
         if local_task is None:
             logger.debug(
-                "A2A delegation submit tracking skipped: local delegation task not found id='{}' remote_task_id='{}'",
-                local_task_id,
+                "A2A delegation submit tracking skipped: local delegation task not found correlation_id='{}' remote_task_id='{}'",
+                correlation_id,
                 remote_task_id,
             )
             return
@@ -395,8 +414,9 @@ class A2AChannel(BaseChannel):
         local_task.updated_at = time.time()
 
         logger.debug(
-            "A2A delegation submit tracking updated: local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
-            local_task_id,
+            "A2A delegation submit tracking updated: correlation_id='{}' local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
+            correlation_id,
+            local_task.id,
             remote_task_id,
             status_url,
             events_url,
@@ -642,6 +662,8 @@ class A2AChannel(BaseChannel):
         reply_to_base = envelope.get("reply_to_base")
         metadata["_a2a"] = {
             "message_id": envelope.get("message_id"),
+            "message_type": envelope.get("message_type"),
+            "correlation_id": envelope.get("correlation_id"),
             "task_id": envelope.get("task_id"),
             "from_agent": sender,
             "to_agent": envelope.get("to_agent"),
@@ -686,10 +708,14 @@ class A2AChannel(BaseChannel):
         session_key = metadata.pop("session_key", None)
         task_id = metadata.get("task_id")
         intent = metadata.get("intent")
+        message_type = metadata.get("message_type") or MESSAGE_TYPE_DELEGATION_REQUEST
+        correlation_id = metadata.get("correlation_id")
 
         envelope: dict[str, Any] = {
-            "protocol": _PROTOCOL,
+            "protocol": PROTOCOL,
             "message_id": message_id,
+            "message_type": message_type,
+            "correlation_id": correlation_id,
             "task_id": task_id,
             "from_agent": self.config.agent_id,
             "to_agent": target_agent,
@@ -708,81 +734,26 @@ class A2AChannel(BaseChannel):
         if advertised:
             envelope["reply_to_base"] = advertised
 
-        if self._should_sign():
-            envelope["auth"] = self._make_auth(envelope)
+        if should_sign(self.config.shared_secret):
+            envelope["auth"] = make_auth(envelope, self.config.shared_secret)
 
         return envelope
 
     def _verify_inbound_envelope(self, envelope: dict[str, Any]) -> tuple[bool, str | None]:
-        protocol = envelope.get("protocol")
-        if protocol != _PROTOCOL:
-            return False, f"unsupported protocol: {protocol}"
+        policy = A2AEnvelopePolicy(
+            agent_id=self.config.agent_id,
+            shared_secret=self.config.shared_secret,
+            require_auth=self.config.require_auth,
+            clock_skew_seconds=self.config.clock_skew_seconds,
+            protocol=PROTOCOL,
+        )
+        return validate_inbound_envelope(
+            envelope,
+            policy=policy,
+            seen_nonces=self._seen_nonces,
+        )
 
-        to_agent = envelope.get("to_agent")
-        if to_agent not in (None, "", self.config.agent_id, "*"):
-            return False, f"wrong recipient: {to_agent}"
 
-        from_agent = envelope.get("from_agent")
-        if not isinstance(from_agent, str) or not from_agent:
-            return False, "missing from_agent"
-
-        timestamp = envelope.get("timestamp")
-        if not isinstance(timestamp, int):
-            return False, "missing or invalid timestamp"
-
-        skew = abs(int(time.time()) - timestamp)
-        if skew > self.config.clock_skew_seconds:
-            return False, f"timestamp skew too large ({skew}s)"
-
-        nonce = envelope.get("nonce")
-        if not isinstance(nonce, str) or not nonce:
-            return False, "missing nonce"
-
-        if nonce in self._seen_nonces:
-            return False, "replay detected (nonce already seen)"
-        self._seen_nonces[nonce] = time.time()
-
-        has_auth = isinstance(envelope.get("auth"), dict)
-        if self.config.require_auth and not has_auth:
-            return False, "authentication required"
-
-        if has_auth:
-            if not self.config.shared_secret:
-                return False, "auth provided but shared_secret is not configured"
-            ok, err = self._verify_auth(envelope)
-            if not ok:
-                return False, err
-
-        return True, None
-
-    def _verify_auth(self, envelope: dict[str, Any]) -> tuple[bool, str | None]:
-        auth = envelope.get("auth")
-        if not isinstance(auth, dict):
-            return False, "invalid auth object"
-
-        method = auth.get("method")
-        signature = auth.get("signature")
-        if method != _AUTH_METHOD:
-            return False, f"unsupported auth method: {method}"
-        if not isinstance(signature, str) or not signature:
-            return False, "missing signature"
-
-        expected = self._sign_envelope(envelope)
-        if not hmac.compare_digest(signature, expected):
-            return False, "signature mismatch"
-        return True, None
-
-    def _make_auth(self, envelope: dict[str, Any]) -> dict[str, str]:
-        return {"method": _AUTH_METHOD, "signature": self._sign_envelope(envelope)}
-
-    def _sign_envelope(self, envelope: dict[str, Any]) -> str:
-        body = dict(envelope)
-        body.pop("auth", None)
-        payload = self._canonical_json(body).encode("utf-8")
-        return hmac.new(self.config.shared_secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-
-    def _should_sign(self) -> bool:
-        return bool(self.config.shared_secret)
 
     def _resolve_send_mode(self, metadata: dict[str, Any]) -> Literal["push", "async", "sse"]:
         raw = metadata.get("a2a_mode")
@@ -864,18 +835,7 @@ class A2AChannel(BaseChannel):
 
     @staticmethod
     def _normalize_base_url(value: str) -> str | None:
-        v = value.strip().rstrip("/")
-        if not v:
-            return None
-        try:
-            parsed = urlsplit(v)
-        except Exception:
-            return None
-        if parsed.scheme not in {"http", "https"}:
-            return None
-        if not parsed.netloc:
-            return None
-        return v
+        return normalize_base_url(value)
 
     async def _publish_task_event(self, task_id: str, event: dict[str, Any]) -> None:
         for q in list(self._task_watchers.get(task_id, set())):
@@ -995,12 +955,8 @@ class A2AChannel(BaseChannel):
         except Exception:
             return None
 
-    @staticmethod
-    def _canonical_json(data: dict[str, Any]) -> str:
-        return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
 
     @staticmethod
     def _join_url(base: str, path: str) -> str:
-        b = base.rstrip("/")
-        p = path if path.startswith("/") else f"/{path}"
-        return f"{b}{p}"
+        return join_url(base, path)
