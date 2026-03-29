@@ -83,6 +83,9 @@ You are nanobot, a helpful AI assistant.
 Your workspace is at: {workspace_path}
 - Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
+- Delegation audit log (append-only JSONL): {workspace_path}/memory/delegation_tasks.jsonl
+  - One JSON object per line describing delegation lifecycle events (create, bind, completion, expiry).
+  - Read it with file tools (or line-based shell commands) when users ask about delegated requests, routing history, or tuning delegation behavior.
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
@@ -99,11 +102,51 @@ Your workspace is at: {workspace_path}
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
     @staticmethod
-    def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
+    def _build_runtime_context(
+        channel: str | None,
+        chat_id: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str()}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+
+        meta = metadata if isinstance(metadata, dict) else {}
+
+        def _add_line(label: str, value: Any) -> None:
+            if isinstance(value, str):
+                value = value.strip()
+            if value not in ("", None):
+                lines.append(f"{label}: {value}")
+
+        # Flat metadata useful for delegation/routing decisions.
+        _add_line("Upstream Channel", meta.get("upstream_channel"))
+        _add_line("Upstream Chat ID", meta.get("upstream_chat_id"))
+        _add_line("Delegation Task ID", meta.get("delegation_task_id"))
+        _add_line("Delegated Task ID", meta.get("delegated_task_id"))
+        _add_line("Task ID", meta.get("task_id"))
+        _add_line("A2A Remote Task ID", meta.get("a2a_remote_task_id"))
+        _add_line("Allow Agent Conversation", meta.get("allow_agent_conversation"))
+        _add_line("A2A Allow Agent Conversation", meta.get("a2a_allow_agent_conversation"))
+
+        # Nested A2A envelope metadata.
+        raw_a2a = meta.get("_a2a")
+        a2a = raw_a2a if isinstance(raw_a2a, dict) else {}
+        _add_line("A2A From Agent", a2a.get("from_agent"))
+        _add_line("A2A To Agent", a2a.get("to_agent"))
+        _add_line("A2A Intent", a2a.get("intent"))
+        _add_line("A2A Mode", a2a.get("mode"))
+        _add_line("A2A Message ID", a2a.get("message_id"))
+        _add_line("A2A Task ID", a2a.get("task_id"))
+
+        # Nested delegation metadata.
+        raw_delegation = meta.get("_delegation")
+        delegation = raw_delegation if isinstance(raw_delegation, dict) else {}
+        _add_line("Delegation Local Task ID", delegation.get("delegation_task_id"))
+        _add_line("Delegation Remote Task ID", delegation.get("delegated_task_id"))
+        _add_line("Delegation Intent", delegation.get("intent"))
+
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     def _load_bootstrap_files(self) -> str:
@@ -127,9 +170,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id)
+        runtime_ctx = self._build_runtime_context(channel, chat_id, metadata)
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message

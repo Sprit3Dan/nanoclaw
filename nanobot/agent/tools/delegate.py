@@ -212,6 +212,16 @@ class DelegateTaskTool(Tool):
                 origin_channel=origin_channel,
                 origin_chat_id=origin_chat_id,
                 delegated_channel="a2a",
+                metadata={
+                    "initial_request": {
+                        "task": task,
+                        "target_agent": target_agent,
+                        "intent": route_intent,
+                        "mode": mode_l,
+                        "origin_channel": origin_channel,
+                        "origin_chat_id": origin_chat_id,
+                    },
+                },
             )
             self._delegation_queue.bind_delegated_task_id(
                 delegation_task_id=local_task.id,

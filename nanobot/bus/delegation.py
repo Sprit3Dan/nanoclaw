@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from threading import RLock
 from typing import Any, Mapping
 
@@ -62,6 +66,8 @@ class DelegationTaskMap:
         self._lock = RLock()
         self._tasks: dict[str, DelegationTask] = {}
         self._by_delegated_task_id: dict[str, str] = {}
+        raw_audit_path = os.environ.get("NANOBOT_DELEGATION_AUDIT_JSONL", "memory/delegation_tasks.jsonl")
+        self._audit_path = Path(raw_audit_path).expanduser()
 
     def create(
         self,
@@ -97,6 +103,17 @@ class DelegationTaskMap:
             task.origin_channel,
             task.origin_chat_id,
             task.delegated_channel,
+        )
+        self._append_audit_event(
+            "create",
+            task,
+            extra={
+                "reply_channel": task.reply_channel,
+                "reply_chat_id": task.reply_chat_id,
+                "origin_channel": task.origin_channel,
+                "origin_chat_id": task.origin_chat_id,
+                "delegated_channel": task.delegated_channel,
+            },
         )
         return task
 
@@ -144,6 +161,14 @@ class DelegationTaskMap:
                 remote_id,
                 task.delegated_agent_id,
                 task.status,
+            )
+            self._append_audit_event(
+                "bind_delegated_task_id",
+                task,
+                extra={
+                    "delegated_task_id": remote_id,
+                    "delegated_agent_id": task.delegated_agent_id,
+                },
             )
             return True
 
@@ -213,6 +238,11 @@ class DelegationTaskMap:
                 task.delegated_task_id,
                 task.completed_at,
             )
+            self._append_audit_event(
+                "mark_completed",
+                task,
+                extra={"completed_at": task.completed_at},
+            )
             return True
 
     def expire(self, *, older_than_seconds: int) -> int:
@@ -238,6 +268,11 @@ class DelegationTaskMap:
                     task.delegated_task_id,
                     ttl,
                 )
+                self._append_audit_event(
+                    "expire",
+                    task,
+                    extra={"ttl_seconds": ttl},
+                )
 
         logger.debug("delegation.expire summary ttl_s={} expired={}", ttl, expired)
         return expired
@@ -245,6 +280,41 @@ class DelegationTaskMap:
     def list_active(self) -> list[DelegationTask]:
         with self._lock:
             return [task for task in self._tasks.values() if task.is_active()]
+
+    def _append_audit_event(
+        self,
+        event: str,
+        task: DelegationTask,
+        *,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        row: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "delegation_task_id": task.id,
+            "status": task.status,
+            "reply_channel": task.reply_channel,
+            "reply_chat_id": task.reply_chat_id,
+            "origin_channel": task.origin_channel,
+            "origin_chat_id": task.origin_chat_id,
+            "delegated_channel": task.delegated_channel,
+            "delegated_task_id": task.delegated_task_id,
+            "delegated_agent_id": task.delegated_agent_id,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "completed_at": task.completed_at,
+            "metadata": task.metadata,
+        }
+        if extra:
+            row["extra"] = dict(extra)
+
+        try:
+            path = self._audit_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("delegation.audit append failed event={} task_id={} err={}", event, task.id, exc)
 
     @staticmethod
     def _new_id() -> str:
