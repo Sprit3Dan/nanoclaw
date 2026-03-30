@@ -69,7 +69,7 @@ class MessageBus:
             "pending": [
                 {
                     "id": t.id,
-                    "correlation_id": t.correlation_id,
+                    "delegation_id": t.delegation_id,
                     "status": t.status,
                     "age_seconds": max(0, int(now - t.created_at)),
                     "reply_channel": t.reply_channel,

@@ -134,9 +134,11 @@ def validate_inbound_envelope(
     if message_type != MESSAGE_TYPE_DELEGATION_REQUEST:
         return False, f"unsupported message_type: {message_type}"
 
-    correlation_id = envelope.get("correlation_id")
-    if not isinstance(correlation_id, str) or not correlation_id.strip():
-        return False, "missing correlation_id"
+    # delegation_id is the canonical and required delegation lifecycle key.
+    # Do not accept correlation_id as a substitute.
+    delegation_id = envelope.get("delegation_id")
+    if not isinstance(delegation_id, str) or not delegation_id.strip():
+        return False, "missing delegation_id"
 
     timestamp = envelope.get("timestamp")
     if not isinstance(timestamp, int):

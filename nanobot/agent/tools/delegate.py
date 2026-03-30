@@ -143,7 +143,7 @@ class DelegateTaskTool(Tool):
 
         # Keep contract explicit but auto-generated to minimize tool-call parameters.
         message_type = "delegation_request"
-        correlation_id = uuid.uuid4().hex
+        delegation_id = uuid.uuid4().hex
 
         register_url = self._register_url_from_base(discovery_base_url)
         logger.debug(
@@ -185,7 +185,7 @@ class DelegateTaskTool(Tool):
 
         extra = {
             "message_type": message_type,
-            "correlation_id": correlation_id,
+            "delegation_id": delegation_id,
             "a2a_peer_base": route.base_url,
         }
 
@@ -200,7 +200,7 @@ class DelegateTaskTool(Tool):
             delegation_queue.create(
                 reply_channel=origin_channel,
                 reply_chat_id=origin_chat_id,
-                correlation_id=correlation_id,
+                delegation_id=delegation_id,
                 origin_channel=origin_channel,
                 origin_chat_id=origin_chat_id,
                 delegated_channel="a2a",
@@ -210,12 +210,12 @@ class DelegateTaskTool(Tool):
                         "target_agent": target_agent,
                         "origin_channel": origin_channel,
                         "origin_chat_id": origin_chat_id,
-                        "correlation_id": correlation_id,
+                        "delegation_id": delegation_id,
                     },
                 },
             )
             delegation_queue.bind_remote_task_id(
-                correlation_id=correlation_id,
+                delegation_id=delegation_id,
                 delegated_task_id=task_id,
                 delegated_agent_id=chat_id,
             )
@@ -240,7 +240,7 @@ class DelegateTaskTool(Tool):
 
         return (
             f"Delegated task {task_id} to {chat_id} via {route.base_url} "
-            f"(mode={mode_l}, message_type={message_type}, correlation_id={correlation_id})."
+            f"(mode={mode_l}, message_type={message_type}, delegation_id={delegation_id})."
         )
 
     @staticmethod

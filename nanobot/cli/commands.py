@@ -873,10 +873,9 @@ def gateway(
             if not isinstance(item, dict):
                 continue
             lines.append(
-                "- delegation_id={id} correlation_id={correlation_id} delegated_task_id={task_id} delegated_agent={agent} "
+                "- delegation_id={delegation_id} delegated_task_id={task_id} delegated_agent={agent} "
                 "age_s={age} reply={channel}:{chat}".format(
-                    id=item.get("id", ""),
-                    correlation_id=item.get("correlation_id", ""),
+                    delegation_id=item.get("delegation_id", item.get("id", "")),
                     task_id=item.get("delegated_task_id", ""),
                     agent=item.get("delegated_agent_id", ""),
                     age=item.get("age_seconds", ""),

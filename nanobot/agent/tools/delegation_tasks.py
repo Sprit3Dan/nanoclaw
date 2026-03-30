@@ -23,7 +23,7 @@ class DelegationTasksTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "List pending delegation tasks correlated by correlation_id. "
+            "List pending delegation tasks correlated by delegation_id. "
             "Use this to inspect active delegated conversations."
         )
 
@@ -39,7 +39,7 @@ class DelegationTasksTool(Tool):
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Local delegation task id (correlation-tracked; required for action=get).",
+                    "description": "Local delegation task id (delegation-id tracked; required for action=get).",
                 },
                 "limit": {
                     "type": "integer",
@@ -111,7 +111,7 @@ class DelegationTasksTool(Tool):
             "age_seconds": max(0, int(time.time() - task.created_at)),
             "reply_channel": task.reply_channel,
             "reply_chat_id": task.reply_chat_id,
-            "correlation_id": task.correlation_id,
+            "delegation_id": task.delegation_id,
             "origin_channel": task.origin_channel,
             "origin_chat_id": task.origin_chat_id,
             "delegated_channel": task.delegated_channel,

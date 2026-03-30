@@ -71,7 +71,7 @@ class DelegationRouter:
         Policy:
         - Non-A2A: reply to original channel/chat.
         - A2A:
-          1) Resolve upstream target by `correlation_id` only.
+          1) Resolve upstream target by `delegation_id` only.
           2) If a correlated delegation task exists, route to its reply target and mark completed.
           3) Otherwise, fallback to replying over A2A to the sender agent.
         """
@@ -85,10 +85,10 @@ class DelegationRouter:
                 metadata=response_metadata,
             )
 
-        correlation_id = self._extract_correlation_id(response_metadata)
+        delegation_id = self._extract_delegation_id(response_metadata)
 
-        if correlation_id:
-            active_delegation = self._delegation.resolve({"correlation_id": correlation_id})
+        if delegation_id:
+            active_delegation = self._delegation.resolve({"delegation_id": delegation_id})
             if active_delegation is not None:
                 reply_channel = active_delegation.reply_channel
                 reply_chat_id = active_delegation.reply_chat_id
@@ -101,9 +101,9 @@ class DelegationRouter:
                         metadata=response_metadata,
                     )
         else:
-            correlation_id = uuid.uuid4().hex
+            delegation_id = uuid.uuid4().hex
 
-        response_metadata["correlation_id"] = correlation_id
+        response_metadata["delegation_id"] = delegation_id
         if not self._str_meta(response_metadata, "message_type"):
             response_metadata["message_type"] = "delegation_request"
 
@@ -127,20 +127,20 @@ class DelegationRouter:
         value = meta.get(key)
         return value.strip() if isinstance(value, str) else ""
 
-    def _extract_correlation_id(self, metadata: dict[str, Any]) -> str:
-        correlation_id = self._str_meta(metadata, "correlation_id")
-        if correlation_id:
-            return correlation_id
+    def _extract_delegation_id(self, metadata: dict[str, Any]) -> str:
+        delegation_id = self._str_meta(metadata, "delegation_id")
+        if delegation_id:
+            return delegation_id
 
         raw_a2a = metadata.get("_a2a")
         a2a_ctx = raw_a2a if isinstance(raw_a2a, dict) else {}
-        correlation_id = self._str_meta(a2a_ctx, "correlation_id")
-        if correlation_id:
-            return correlation_id
+        delegation_id = self._str_meta(a2a_ctx, "delegation_id")
+        if delegation_id:
+            return delegation_id
 
         raw_delegation = metadata.get("_delegation")
         delegation_ctx = raw_delegation if isinstance(raw_delegation, dict) else {}
-        return self._str_meta(delegation_ctx, "correlation_id")
+        return self._str_meta(delegation_ctx, "delegation_id")
 
     def _is_channel_enabled(self, channel_name: str) -> bool:
         if not channel_name:

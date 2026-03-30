@@ -124,7 +124,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         _add_line("Upstream Channel", meta.get("upstream_channel"))
         _add_line("Upstream Chat ID", meta.get("upstream_chat_id"))
         _add_line("Message Type", meta.get("message_type"))
-        _add_line("Correlation ID", meta.get("correlation_id"))
+        _add_line("Delegation ID", meta.get("delegation_id"))
         _add_line("Task ID", meta.get("task_id"))
         _add_line("A2A Remote Task ID", meta.get("a2a_remote_task_id"))
 
@@ -134,7 +134,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         _add_line("A2A From Agent", a2a.get("from_agent"))
         _add_line("A2A To Agent", a2a.get("to_agent"))
         _add_line("A2A Message Type", a2a.get("message_type"))
-        _add_line("A2A Correlation ID", a2a.get("correlation_id"))
+        _add_line("A2A Delegation ID", a2a.get("delegation_id"))
         _add_line("A2A Intent", a2a.get("intent"))
         _add_line("A2A Mode", a2a.get("mode"))
         _add_line("A2A Message ID", a2a.get("message_id"))
@@ -144,7 +144,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         raw_delegation = meta.get("_delegation")
         delegation = raw_delegation if isinstance(raw_delegation, dict) else {}
         _add_line("Delegation Message Type", delegation.get("message_type"))
-        _add_line("Delegation Correlation ID", delegation.get("correlation_id"))
+        _add_line("Delegation ID", delegation.get("delegation_id"))
         _add_line("Delegation Intent", delegation.get("intent"))
 
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)

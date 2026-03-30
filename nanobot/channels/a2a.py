@@ -366,18 +366,18 @@ class A2AChannel(BaseChannel):
             if delegation_meta is not None:
                 delegation_meta["remote_events_url"] = events_url
 
-        correlation_id_raw = metadata.get("correlation_id")
-        if not correlation_id_raw and delegation_meta is not None:
-            correlation_id_raw = delegation_meta.get("correlation_id")
+        delegation_id_raw = metadata.get("delegation_id")
+        if not delegation_id_raw and delegation_meta is not None:
+            delegation_id_raw = delegation_meta.get("delegation_id")
 
-        correlation_id = (
-            str(correlation_id_raw).strip()
-            if isinstance(correlation_id_raw, str)
+        delegation_id = (
+            str(delegation_id_raw).strip()
+            if isinstance(delegation_id_raw, str)
             else ""
         )
-        if not correlation_id:
+        if not delegation_id:
             logger.debug(
-                "A2A delegation submit tracking skipped: missing correlation_id for remote_task_id='{}'",
+                "A2A delegation submit tracking skipped: missing delegation_id for remote_task_id='{}'",
                 remote_task_id,
             )
             return
@@ -391,16 +391,16 @@ class A2AChannel(BaseChannel):
 
         if remote_task_id:
             self.bus.delegation.bind_remote_task_id(
-                correlation_id=correlation_id,
+                delegation_id=delegation_id,
                 delegated_task_id=remote_task_id,
                 delegated_agent_id=delegated_agent_id,
             )
 
-        local_task = self.bus.delegation.resolve({"correlation_id": correlation_id})
+        local_task = self.bus.delegation.resolve({"delegation_id": delegation_id})
         if local_task is None:
             logger.debug(
-                "A2A delegation submit tracking skipped: local delegation task not found correlation_id='{}' remote_task_id='{}'",
-                correlation_id,
+                "A2A delegation submit tracking skipped: local delegation task not found delegation_id='{}' remote_task_id='{}'",
+                delegation_id,
                 remote_task_id,
             )
             return
@@ -414,8 +414,8 @@ class A2AChannel(BaseChannel):
         local_task.updated_at = time.time()
 
         logger.debug(
-            "A2A delegation submit tracking updated: correlation_id='{}' local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
-            correlation_id,
+            "A2A delegation submit tracking updated: delegation_id='{}' local_task_id='{}' remote_task_id='{}' status_url='{}' events_url='{}'",
+            delegation_id,
             local_task.id,
             remote_task_id,
             status_url,
@@ -660,10 +660,20 @@ class A2AChannel(BaseChannel):
             metadata = {str(k): v for k, v in raw_metadata.items()}
 
         reply_to_base = envelope.get("reply_to_base")
+        delegation_id_raw = envelope.get("delegation_id")
+        delegation_id = (
+            str(delegation_id_raw).strip()
+            if isinstance(delegation_id_raw, str)
+            else ""
+        )
+
+        if delegation_id:
+            metadata["delegation_id"] = delegation_id
+
         metadata["_a2a"] = {
             "message_id": envelope.get("message_id"),
             "message_type": envelope.get("message_type"),
-            "correlation_id": envelope.get("correlation_id"),
+            "delegation_id": delegation_id,
             "task_id": envelope.get("task_id"),
             "from_agent": sender,
             "to_agent": envelope.get("to_agent"),
@@ -709,13 +719,27 @@ class A2AChannel(BaseChannel):
         task_id = metadata.get("task_id")
         intent = metadata.get("intent")
         message_type = metadata.get("message_type") or MESSAGE_TYPE_DELEGATION_REQUEST
-        correlation_id = metadata.get("correlation_id")
+
+        delegation_id_raw = metadata.get("delegation_id") or metadata.get("delegation_task_id")
+        delegation_id = (
+            str(delegation_id_raw).strip()
+            if isinstance(delegation_id_raw, str)
+            else ""
+        ) or uuid.uuid4().hex[:12]
+
+        metadata["delegation_id"] = delegation_id
+        metadata.setdefault("delegation_task_id", delegation_id)
+
+        raw_delegation = metadata.get("_delegation")
+        delegation_meta = raw_delegation if isinstance(raw_delegation, dict) else {}
+        delegation_meta["delegation_id"] = delegation_id
+        metadata["_delegation"] = delegation_meta
 
         envelope: dict[str, Any] = {
             "protocol": PROTOCOL,
             "message_id": message_id,
             "message_type": message_type,
-            "correlation_id": correlation_id,
+            "delegation_id": delegation_id,
             "task_id": task_id,
             "from_agent": self.config.agent_id,
             "to_agent": target_agent,

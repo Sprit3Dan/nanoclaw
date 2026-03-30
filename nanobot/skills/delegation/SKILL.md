@@ -20,8 +20,8 @@ Use `delegate_task` when another agent should perform part of the work.
 - Keep tool calls simple: default to only `task`; add `target_agent` only when you must force a specific agent.
 - Keep A2A contract minimal and explicit:
   - `message_type`: `delegation_request`
-  - `correlation_id`: required stable ID for the delegation lifecycle
-- Preserve `correlation_id` across follow-up delegated steps.
+  - `delegation_id`: canonical stable ID for the delegation lifecycle
+- Preserve the same `delegation_id` across follow-up delegated steps.
 
 ## Minimal call shape
 
@@ -40,7 +40,7 @@ Tool params:
 
 A2A contract fields (metadata-level, minimal):
 - `message_type` = `delegation_request`
-- `correlation_id` (required)
+- `delegation_id` (required, canonical)
 
 Keep extra metadata small and purposeful. Only add what is needed for routing or traceability.
 
@@ -70,14 +70,14 @@ Treat delegated replies as intermediate until the original user request is satis
 ### Contract handling
 
 When processing A2A delegated exchanges:
-- Treat `correlation_id` as the authoritative linkage key.
+- Treat `delegation_id` as the authoritative linkage key.
 - Keep `message_type=delegation_request` for delegated transport messages.
-- Preserve `correlation_id` on every follow-up.
-- Prefer deterministic routing using correlation over heuristic interpretation.
+- Preserve the same `delegation_id` on every follow-up.
+- Prefer deterministic routing using `delegation_id` over heuristic interpretation.
 
 ### Task closure policy
 
-- Delegation completion is correlated by `correlation_id` and may be closed by routing logic.
+- Delegation completion is correlated by `delegation_id` and may be closed by routing logic.
 - Your responsibility is to finalize at the conversation level:
   - provide the final user answer when criteria are met,
   - avoid additional delegation once the request is solved,
@@ -88,7 +88,7 @@ When processing A2A delegated exchanges:
 - Use `delegation_tasks` to inspect active local delegation tasks (`list_pending`, `get`).
 - Use `delegation_remote_status` to query remote task status when remote status URL tracking is available.
 - Use the append-only delegation audit log at `memory/delegation_tasks.jsonl` for lifecycle/history analysis.
-  - Each line is a standalone JSON object event (`create`, `bind_delegated_task_id`, `mark_completed`, `expire`).
+  - Each line is a standalone JSON object event (`create`, `bind_remote_task_id`, `mark_completed`, `expire`).
   - Prefer file tools to read/filter specific ranges when users ask about prior delegated requests or routing behavior.
   - Treat it as immutable audit history; do not rewrite prior lines.
 
