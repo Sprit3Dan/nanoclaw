@@ -334,7 +334,10 @@ class MemoryConsolidator:
             generation = getattr(self.provider, "generation", None)
             reserved_output = int(getattr(generation, "max_tokens", 0) or 0)
             reserved_output = max(1, reserved_output)
-            input_budget = max(1, self.context_window_tokens - reserved_output)
+            # Keep extra headroom for estimator drift and provider-side token accounting
+            # differences to avoid boundary overflows (input + output > context window).
+            safety_margin = max(256, int(self.context_window_tokens * 0.02))
+            input_budget = max(1, self.context_window_tokens - reserved_output - safety_margin)
 
             estimated, source = self.observed_prompt_tokens(session)
             if estimated <= 0:
@@ -343,11 +346,12 @@ class MemoryConsolidator:
                 return
             if estimated <= input_budget:
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} input-budget (reserved output {}) via {}",
+                    "Token consolidation idle {}: {}/{} input-budget (reserved output {}, safety margin {}) via {}",
                     session.key,
                     estimated,
                     input_budget,
                     reserved_output,
+                    safety_margin,
                     source,
                 )
                 return

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from nanobot.bus.delegation import DelegationTaskMap
@@ -99,7 +100,12 @@ class DelegationRouter:
                         content=content,
                         metadata=response_metadata,
                     )
-            response_metadata["correlation_id"] = correlation_id
+        else:
+            correlation_id = uuid.uuid4().hex
+
+        response_metadata["correlation_id"] = correlation_id
+        if not self._str_meta(response_metadata, "message_type"):
+            response_metadata["message_type"] = "delegation_request"
 
         raw_a2a = response_metadata.get("_a2a")
         a2a_ctx = raw_a2a if isinstance(raw_a2a, dict) else {}

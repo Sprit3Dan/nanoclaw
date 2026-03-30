@@ -31,7 +31,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.utils.helpers import build_status_content
+from nanobot.utils.helpers import build_status_content, estimate_prompt_tokens_chain
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -285,10 +285,36 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
+            requested_max_tokens = int(
+                getattr(getattr(active_provider, "generation", None), "max_tokens", 0) or 0
+            )
+            if requested_max_tokens <= 0:
+                requested_max_tokens = 4096
+
+            prompt_estimate, _ = estimate_prompt_tokens_chain(
+                active_provider,
+                active_model,
+                messages,
+                tool_defs,
+            )
+            available_output_budget = max(1, self.context_window_tokens - max(1, int(prompt_estimate)))
+            clamped_max_tokens = max(1, min(requested_max_tokens, available_output_budget))
+
+            if clamped_max_tokens < requested_max_tokens:
+                logger.debug(
+                    "Clamped max_tokens for route {} from {} to {} (prompt_estimate={}, context_window={})",
+                    route_label,
+                    requested_max_tokens,
+                    clamped_max_tokens,
+                    prompt_estimate,
+                    self.context_window_tokens,
+                )
+
             response = await active_provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
                 model=active_model,
+                max_tokens=clamped_max_tokens,
             )
             usage = response.usage or {}
             prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
