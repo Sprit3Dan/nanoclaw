@@ -31,10 +31,10 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.utils.helpers import build_status_content, estimate_prompt_tokens_chain
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot.utils.helpers import build_status_content, estimate_prompt_tokens_chain
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig, RoutingConfig, WebSearchConfig
@@ -696,7 +696,16 @@ class AgentLoop:
             except asyncio.CancelledError:
                 # Preserve real task cancellation so shutdown can complete cleanly.
                 # Only ignore non-task CancelledError signals that may leak from integrations.
-                if not self._running or asyncio.current_task().cancelling():
+                current_task = asyncio.current_task()
+                is_cancelling = False
+                if current_task is not None:
+                    cancelling = getattr(current_task, "cancelling", None)
+                    if callable(cancelling):
+                        try:
+                            is_cancelling = bool(cancelling())
+                        except Exception:
+                            is_cancelling = False
+                if not self._running or is_cancelling:
                     raise
                 continue
             except Exception as e:
@@ -776,8 +785,8 @@ class AgentLoop:
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
-            except (RuntimeError, BaseExceptionGroup):
-                pass  # MCP SDK cancel scope cleanup is noisy but harmless
+            except Exception:
+                pass  # MCP SDK cleanup can raise runtime/cancel-scope exceptions; safe to ignore on shutdown
             self._mcp_stack = None
 
     def _schedule_background(self, coro) -> None:
@@ -866,6 +875,16 @@ class AgentLoop:
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         msg_meta = msg.metadata or {}
+
+        resolved_reply_channel: str | None = None
+        resolved_reply_chat_id: str | None = None
+        if msg.channel == "a2a":
+            active_delegation = self.bus.delegation_map.resolve(msg_meta)
+            if active_delegation is not None:
+                resolved_reply_channel = active_delegation.reply_channel
+                resolved_reply_chat_id = active_delegation.reply_chat_id
+                self.bus.delegation_map.mark_completed(active_delegation.id)
+
         tool_channel, tool_chat_id = self.delegation_router.resolve_tool_target(msg)
 
         self._set_tool_context(tool_channel, tool_chat_id, msg_meta.get("message_id"))
@@ -912,6 +931,14 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         response_metadata = dict(msg.metadata or {})
+        if resolved_reply_channel and resolved_reply_chat_id:
+            return OutboundMessage(
+                channel=resolved_reply_channel,
+                chat_id=resolved_reply_chat_id,
+                content=final_content,
+                metadata=response_metadata,
+            )
+
         return self.delegation_router.route_response(
             msg=msg,
             content=final_content,

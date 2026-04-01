@@ -103,6 +103,8 @@ class DelegationRouter:
         else:
             delegation_id = uuid.uuid4().hex
 
+
+
         response_metadata["delegation_id"] = delegation_id
         if not self._str_meta(response_metadata, "message_type"):
             response_metadata["message_type"] = "delegation_request"
