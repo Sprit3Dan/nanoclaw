@@ -172,6 +172,7 @@ class AgentLoop:
         self.tools.register(DelegateTaskTool(
             send_callback=self.bus.publish_outbound,
             delegation_queue=self.bus.delegation,
+            workspace=self.workspace,
         ))
         self.tools.register(DelegationTasksTool(delegation_map=self.bus.delegation_map))
         self.tools.register(DelegationRemoteStatusTool(delegation_map=self.bus.delegation_map))
@@ -200,6 +201,17 @@ class AgentLoop:
                 self._mcp_stack = None
         finally:
             self._mcp_connecting = False
+
+    async def _run_startup_hooks(self) -> None:
+        """Call on_agent_start() on all registered tools that override it."""
+        from nanobot.agent.tools.base import Tool as _BaseTool
+        for tool in list(self.tools._tools.values()):
+            if type(tool).on_agent_start is _BaseTool.on_agent_start:
+                continue  # not overridden
+            try:
+                await tool.on_agent_start()
+            except Exception as exc:
+                logger.warning("startup hook failed for tool '{}': {}", tool.name, exc)
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -686,6 +698,7 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        await self._run_startup_hooks()
         logger.info("Agent loop started")
 
         while self._running:

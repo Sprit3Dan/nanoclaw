@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -12,6 +13,32 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from loguru import logger
+
+# ---------------------------------------------------------------------------
+# Dynamic broker URL — set by DelegateTaskTool.on_agent_start() after the
+# discovery service provisions per-agent RabbitMQ credentials.
+# ---------------------------------------------------------------------------
+_dynamic_broker_url: str = ""
+_dynamic_broker_url_event: asyncio.Event | None = None
+
+
+def _get_broker_url_event() -> asyncio.Event:
+    global _dynamic_broker_url_event
+    if _dynamic_broker_url_event is None:
+        _dynamic_broker_url_event = asyncio.Event()
+    return _dynamic_broker_url_event
+
+
+def set_dynamic_broker_url(url: str) -> None:
+    """Called by DelegateTaskTool when discovery returns a provisioned AMQP URL."""
+    global _dynamic_broker_url
+    _dynamic_broker_url = url
+    _get_broker_url_event().set()
+
+
+async def _wait_for_dynamic_broker_url(timeout: float = 30.0) -> str:
+    await asyncio.wait_for(_get_broker_url_event().wait(), timeout=timeout)
+    return _dynamic_broker_url
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -45,36 +72,36 @@ _STATUS_TEXT = {
 
 
 class A2AConfig(Base):
-    """A2A HTTP channel configuration."""
+    """A2A channel configuration."""
 
     enabled: bool = False
     agent_id: str = "agent"
 
-    # Listener
+    # Transport backend: "http" (default) or "rabbitmq"
+    transport_backend: Literal["http", "rabbitmq"] = "http"
+
+    # HTTP transport
     listen_host: str = "0.0.0.0"
     listen_port: int = 19100
-
-    # HTTP paths
-    inbox_path: str = "/inbox"          # push mode ingress
-    async_path: str = "/async"          # async submit endpoint
-    tasks_prefix: str = "/tasks"        # async polling endpoint: /tasks/{task_id}
-    events_prefix: str = "/events"      # SSE endpoint: /events/{task_id}
-
-    # Dynamic routing/discovery
-    advertised_base_url: str = ""  # Optional externally reachable base URL for this agent
+    inbox_path: str = "/inbox"
+    async_path: str = "/async"
+    tasks_prefix: str = "/tasks"
+    events_prefix: str = "/events"
+    advertised_base_url: str = ""
     allow_metadata_route_hint: bool = True
     route_cache_ttl_seconds: int = 900
-
-    # Delivery mode policy
     delivery_mode: Literal["push", "async", "sse", "auto"] = "push"
-
-    # Timeouts
     connect_timeout_s: float = 10.0
     request_timeout_s: float = 20.0
     sse_timeout_s: float = 60.0
     sse_heartbeat_seconds: int = 10
 
-    # Security
+    # RabbitMQ transport
+    rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
+    rabbitmq_exchange: str = "a2a"
+    rabbitmq_queue_prefix: str = "a2a."
+
+    # Security (all transports)
     require_auth: bool = False
     shared_secret: str = ""
     clock_skew_seconds: int = 300
@@ -108,6 +135,8 @@ class A2AChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: A2AConfig = config
 
+        self._transport = self._build_transport()
+
         self._server: asyncio.base_events.Server | None = None
         self._client: httpx.AsyncClient | None = None
 
@@ -121,12 +150,24 @@ class A2AChannel(BaseChannel):
         # Dynamic peer routing cache: agent_id -> (base_url, expires_at)
         self._peer_routes: dict[str, tuple[str, float]] = {}
 
+    def _build_transport(self):
+        if self.config.transport_backend == "rabbitmq":
+            from nanobot.channels.a2a_transport import RabbitMQTransport
+            # URL resolved later in start() — placeholder default here.
+            url = os.environ.get("NANOBOT_A2A_RABBITMQ_URL") or self.config.rabbitmq_url
+            return RabbitMQTransport(
+                url=url,
+                exchange=self.config.rabbitmq_exchange,
+                queue_prefix=self.config.rabbitmq_queue_prefix,
+            )
+        return None  # HTTP mode
+
     def is_allowed(self, sender_id: str) -> bool:
         """A2A channel trusts authenticated/validated envelopes, not allowlists."""
         return True
 
     async def start(self) -> None:
-        """Start HTTP listener and block until stopped."""
+        """Start the A2A channel (broker transport or HTTP server)."""
         self._running = True
 
         if self.config.require_auth and not self.config.shared_secret:
@@ -134,23 +175,44 @@ class A2AChannel(BaseChannel):
             self._running = False
             return
 
-        await self._ensure_client()
-
         self._nonce_gc_task = asyncio.create_task(self._nonce_gc_loop())
 
+        if self._transport is not None:
+            # For dynamic credentials: if no static URL was baked in, wait for
+            # on_agent_start() to deliver the provisioned AMQP URL from discovery.
+            static_url = os.environ.get("NANOBOT_A2A_RABBITMQ_URL", "").strip()
+            if not static_url and self.config.transport_backend == "rabbitmq":
+                try:
+                    dynamic_url = await _wait_for_dynamic_broker_url(timeout=30.0)
+                    self._transport._url = dynamic_url  # patch before connect
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "A2A RabbitMQ: timed out waiting for AMQP URL from discovery — "
+                        "set RABBITMQ_ADMIN_URL on the discovery service or "
+                        "NANOBOT_A2A_RABBITMQ_URL on this agent"
+                    )
+                    return
+            logger.info(
+                "Starting A2A channel as '{}' via {} transport",
+                self.config.agent_id,
+                self.config.transport_backend,
+            )
+            await self._transport.subscribe(self.config.agent_id, self._ingest_envelope_from_transport)
+            return
+
+        # HTTP transport (original path)
+        await self._ensure_client()
         self._server = await asyncio.start_server(
             self._handle_client,
             self.config.listen_host,
             self.config.listen_port,
         )
-
         logger.info(
             "Starting A2A channel as '{}' on http://{}:{}",
             self.config.agent_id,
             self.config.listen_host,
             self.config.listen_port,
         )
-
         while self._running:
             await asyncio.sleep(0.5)
 
@@ -162,6 +224,9 @@ class A2AChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop A2A channel."""
         self._running = False
+
+        if self._transport is not None:
+            await self._transport.stop()
 
         for worker in list(self._task_workers.values()):
             worker.cancel()
@@ -179,16 +244,24 @@ class A2AChannel(BaseChannel):
             await self._client.aclose()
             self._client = None
 
-    async def send(self, msg: OutboundMessage) -> None:
-        """
-        Send A2A message to peer agent.
+    async def _ingest_envelope_from_transport(self, envelope: dict[str, Any]) -> None:
+        ok, result = await self._ingest_envelope(envelope)
+        if not ok:
+            logger.warning("A2A transport ingest failed: {}", result.get("error"))
 
-        Supported modes:
-        - push: fire-and-ack over POST /inbox
-        - async: submit over POST /async and return once task is accepted
-        - sse: submit async + consume progress stream from GET /events/{task_id}
-        """
+    async def send(self, msg: OutboundMessage) -> None:
+        """Send A2A message via broker transport or HTTP."""
         target_agent = msg.chat_id
+
+        if self._transport is not None:
+            envelope = self._build_outbound_envelope(target_agent, msg, mode="push")
+            try:
+                await self._transport.publish(target_agent, envelope)
+            except Exception as e:
+                logger.error("A2A transport send failed to '{}': {}", target_agent, e)
+            return
+
+        # HTTP transport path
         metadata = msg.metadata or {}
         peer_base = await self._resolve_peer_base(target_agent, metadata)
         if not peer_base:
@@ -490,9 +563,9 @@ class A2AChannel(BaseChannel):
             await self._write_json(writer, 400, {"ok": False, "error": "missing envelope"})
             return
 
-        envelope_task_id = envelope.get("task_id")
-        if isinstance(envelope_task_id, str) and envelope_task_id.strip():
-            task_id = envelope_task_id.strip()
+        delegation_id = envelope.get("delegation_id")
+        if isinstance(delegation_id, str) and delegation_id.strip():
+            task_id = delegation_id.strip()
         else:
             task_id = uuid.uuid4().hex[:12]
 
@@ -716,7 +789,6 @@ class A2AChannel(BaseChannel):
 
         metadata = dict(msg.metadata or {})
         session_key = metadata.pop("session_key", None)
-        task_id = metadata.get("task_id")
         intent = metadata.get("intent")
         message_type = metadata.get("message_type") or MESSAGE_TYPE_DELEGATION_REQUEST
 
@@ -740,7 +812,7 @@ class A2AChannel(BaseChannel):
             "message_id": message_id,
             "message_type": message_type,
             "delegation_id": delegation_id,
-            "task_id": task_id,
+            "task_id": delegation_id,
             "from_agent": self.config.agent_id,
             "to_agent": target_agent,
             "chat_id": metadata.pop("chat_id", self.config.agent_id),

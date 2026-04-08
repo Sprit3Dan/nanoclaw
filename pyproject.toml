@@ -51,6 +51,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+a2a-rabbitmq = [
+    "aio-pika>=9.0.0,<10.0.0",
+]
 wecom = [
     "wecom-aibot-sdk-python>=0.1.5",
 ]

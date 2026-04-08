@@ -6,6 +6,23 @@ x-common-config: &common-config
     - ~/.nanobot:/root/.nanobot
 
 services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # management UI (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - a2a-mq
+
   nanobot-gateway:
     container_name: nanobot-gateway
     <<: *common-config

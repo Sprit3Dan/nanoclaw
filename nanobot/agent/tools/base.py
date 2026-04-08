@@ -53,6 +53,10 @@ class Tool(ABC):
         """JSON Schema for tool parameters."""
         pass
 
+    async def on_agent_start(self) -> None:
+        """Called once after the agent loop starts. Override for startup behaviour."""
+        pass
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> Any:
         """

@@ -1,12 +1,27 @@
 ---
 name: delegation
 description: Delegate work to specialist agents via discovery-routed A2A.
-metadata: {"nanobot":{"emoji":"🛰️","always":true}}
+metadata: {"nanobot":{"emoji":"🛰️","always":true,"on_start":true}}
 ---
 
 # Delegation
 
 Use `delegate_task` when another agent should perform part of the work.
+
+## Registration
+
+Before delegating tasks this agent must be registered with the A2A discovery
+service so other agents can find it.  Run once at startup (idempotent):
+
+```bash
+python <skill_location>/scripts/register.py
+```
+
+(`<skill_location>` is the path shown in the `<location>` tag of this skill's
+entry in the skills summary.)
+
+Required env vars: `NANOBOT_DISCOVERY_BASE_URL`, `NANOBOT_A2A_AGENT_ID`
+Optional: `NANOBOT_WORKSPACE`, `NANOBOT_A2A_ADVERTISED_BASE_URL`, `NANOBOT_A2A_LISTEN_PORT`
 
 ## Core rules
 
