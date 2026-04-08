@@ -93,13 +93,20 @@ class DelegationRouter:
                 reply_channel = active_delegation.reply_channel
                 reply_chat_id = active_delegation.reply_chat_id
                 if reply_channel and reply_chat_id:
-                    self._delegation.mark_completed(active_delegation.id)
-                    return OutboundMessage(
+                    outbound = OutboundMessage(
                         channel=reply_channel,
                         chat_id=reply_chat_id,
                         content=content,
                         metadata=response_metadata,
                     )
+                    self._delegation.record_status_event(
+                        delegation_id,
+                        status="completed",
+                        from_agent=str(msg.sender_id),
+                        payload={"phase": "route_response"},
+                    )
+                    self._delegation.mark_completed(active_delegation.id)
+                    return outbound
         else:
             delegation_id = uuid.uuid4().hex
 

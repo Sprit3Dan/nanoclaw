@@ -919,8 +919,8 @@ class A2AChannel(BaseChannel):
             await self._publish_delegation_status_event(
                 owner_agent,
                 delegation_id,
-                "running",
-                {"from_agent": sender, "phase": "ingest"},
+                "received",
+                {"from_agent": sender, "phase": "received"},
             )
 
         try:
@@ -941,14 +941,6 @@ class A2AChannel(BaseChannel):
                     {"error": str(exc)},
                 )
             return False, {"error": f"handler failed: {exc}"}
-
-        if self._transport is not None and delegation_id and owner_agent:
-            await self._publish_delegation_status_event(
-                owner_agent,
-                delegation_id,
-                "completed",
-                {"accepted": True, "message_id": envelope.get("message_id")},
-            )
 
         return True, {"accepted": True, "message_id": envelope.get("message_id")}
 

@@ -891,12 +891,13 @@ class AgentLoop:
 
         resolved_reply_channel: str | None = None
         resolved_reply_chat_id: str | None = None
+        completion_delegation_id: str | None = None
         if msg.channel == "a2a":
             active_delegation = self.bus.delegation_map.resolve(msg_meta)
             if active_delegation is not None:
                 resolved_reply_channel = active_delegation.reply_channel
                 resolved_reply_chat_id = active_delegation.reply_chat_id
-                self.bus.delegation_map.mark_completed(active_delegation.id)
+                completion_delegation_id = active_delegation.id
 
         tool_channel, tool_chat_id = self.delegation_router.resolve_tool_target(msg)
 
@@ -945,6 +946,8 @@ class AgentLoop:
 
         response_metadata = dict(msg.metadata or {})
         if resolved_reply_channel and resolved_reply_chat_id:
+            if completion_delegation_id:
+                self.bus.delegation_map.mark_completed(completion_delegation_id)
             return OutboundMessage(
                 channel=resolved_reply_channel,
                 chat_id=resolved_reply_chat_id,
