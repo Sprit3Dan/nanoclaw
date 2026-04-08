@@ -84,7 +84,7 @@ class RabbitMQTransport(A2ATransport):
         )
 
         async def _on_message(msg: aio_pika.IncomingMessage) -> None:
-            async with msg.process(requeue_on_timeout=True):
+            async with msg.process(requeue=True):
                 try:
                     envelope = json.loads(msg.body.decode("utf-8"))
                 except Exception as exc:
