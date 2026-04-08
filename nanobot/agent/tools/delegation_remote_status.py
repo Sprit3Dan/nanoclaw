@@ -67,12 +67,16 @@ class DelegationRemoteStatusTool(Tool):
         if task is None:
             return f"Delegation task not found: {local_id}"
 
-        status_url = self._pick_remote_status_url(task)
-        if not status_url:
-            return "Error: remote status URL is missing in task metadata."
+        broker_result = self._broker_status_snapshot(local_id)
+        if broker_result is not None:
+            remote_result = broker_result
+        else:
+            status_url = self._pick_remote_status_url(task)
+            if not status_url:
+                return "Error: no broker status event and remote status URL is missing in task metadata."
 
-        timeout = self._timeout_from_env()
-        remote_result = await self._fetch_remote_status(status_url, timeout=timeout)
+            timeout = self._timeout_from_env()
+            remote_result = await self._fetch_remote_status(status_url, timeout=timeout)
 
         payload = {
             "local_task": self._serialize(task, include_metadata=True),
@@ -109,6 +113,31 @@ class DelegationRemoteStatusTool(Tool):
             out["body_text"] = (resp.text or "")[:2000]
 
         return out
+
+    def _broker_status_snapshot(self, local_id: str) -> dict[str, Any] | None:
+        if not self._delegation_map:
+            return None
+
+        task = self._delegation_map.get(local_id)
+        if task is None:
+            return None
+
+        event = self._delegation_map.get_status_event(task.delegation_id)
+        if not isinstance(event, dict):
+            return None
+
+        status = str(event.get("status", "")).strip().lower()
+        payload = event.get("payload")
+        body = payload if isinstance(payload, dict) else {"value": payload}
+        return {
+            "ok": status in {"completed", "done"},
+            "source": "broker",
+            "delegation_id": task.delegation_id,
+            "status": status or "unknown",
+            "from_agent": str(event.get("from_agent", "")).strip(),
+            "updated_at": event.get("updated_at"),
+            "body": body,
+        }
 
     @classmethod
     def _timeout_from_env(cls) -> float:

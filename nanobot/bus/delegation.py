@@ -68,6 +68,7 @@ class DelegationTaskMap:
         self._lock = RLock()
         self._tasks: dict[str, DelegationTask] = {}
         self._by_delegation_id: dict[str, str] = {}
+        self._status_by_delegation_id: dict[str, dict[str, Any]] = {}
         raw_audit_path = os.environ.get("NANOBOT_DELEGATION_AUDIT_JSONL", "memory/delegation_tasks.jsonl")
         self._audit_path = Path(raw_audit_path).expanduser()
 
@@ -230,6 +231,48 @@ class DelegationTaskMap:
             return None
         return task.reply_channel, task.reply_chat_id
 
+    def record_status_event(
+        self,
+        delegation_id: str,
+        *,
+        status: str,
+        from_agent: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Store latest broker status event for a delegation_id."""
+        did = str(delegation_id).strip()
+        st = str(status).strip()
+        if not did or not st:
+            return False
+
+        event: dict[str, Any] = {
+            "delegation_id": did,
+            "status": st,
+            "from_agent": (str(from_agent).strip() if isinstance(from_agent, str) else ""),
+            "updated_at": time.time(),
+            "payload": dict(payload or {}),
+        }
+
+        with self._lock:
+            self._status_by_delegation_id[did] = event
+
+        logger.debug(
+            "delegation.status.record delegation_id={} status={} from_agent={}",
+            did,
+            st,
+            event["from_agent"],
+        )
+        return True
+
+    def get_status_event(self, delegation_id: str) -> dict[str, Any] | None:
+        """Return latest broker status event by delegation_id."""
+        did = str(delegation_id).strip()
+        if not did:
+            return None
+        with self._lock:
+            event = self._status_by_delegation_id.get(did)
+            return dict(event) if isinstance(event, dict) else None
+
     def mark_completed(self, delegation_task_id: str) -> bool:
         local_id = str(delegation_task_id).strip()
         if not local_id:
@@ -249,6 +292,7 @@ class DelegationTaskMap:
             task.completed_at = time.time()
             task.updated_at = task.completed_at
             self._by_delegation_id.pop(task.delegation_id, None)
+            self._status_by_delegation_id.pop(task.delegation_id, None)
             logger.debug(
                 "delegation.complete local_id={} remote_id={} completed_at={}",
                 task.id,
@@ -277,6 +321,7 @@ class DelegationTaskMap:
                 task.status = "expired"
                 task.updated_at = time.time()
                 self._by_delegation_id.pop(task.delegation_id, None)
+                self._status_by_delegation_id.pop(task.delegation_id, None)
                 expired += 1
                 logger.debug(
                     "delegation.expire local_id={} remote_id={} ttl_s={}",

@@ -14,6 +14,21 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 from loguru import logger
 
+from nanobot.bus.events import OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.a2a_protocol import (
+    A2AEnvelopePolicy,
+    MESSAGE_TYPE_DELEGATION_REQUEST,
+    PROTOCOL,
+    join_url,
+    make_auth,
+    normalize_base_url,
+    should_sign,
+    validate_inbound_envelope,
+)
+from nanobot.channels.base import BaseChannel
+from nanobot.config.schema import Base
+
 # ---------------------------------------------------------------------------
 # Dynamic broker URL — set by DelegateTaskTool.on_agent_start() after the
 # discovery service provisions per-agent RabbitMQ credentials.
@@ -39,21 +54,6 @@ def set_dynamic_broker_url(url: str) -> None:
 async def _wait_for_dynamic_broker_url(timeout: float = 30.0) -> str:
     await asyncio.wait_for(_get_broker_url_event().wait(), timeout=timeout)
     return _dynamic_broker_url
-
-from nanobot.bus.events import OutboundMessage
-from nanobot.bus.queue import MessageBus
-from nanobot.channels.a2a_protocol import (
-    A2AEnvelopePolicy,
-    MESSAGE_TYPE_DELEGATION_REQUEST,
-    PROTOCOL,
-    join_url,
-    make_auth,
-    normalize_base_url,
-    should_sign,
-    validate_inbound_envelope,
-)
-from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import Base
 
 _STATUS_TEXT = {
     200: "OK",
@@ -197,7 +197,11 @@ class A2AChannel(BaseChannel):
                 self.config.agent_id,
                 self.config.transport_backend,
             )
-            await self._transport.subscribe(self.config.agent_id, self._ingest_envelope_from_transport)
+            await self._transport.subscribe(
+                self.config.agent_id,
+                self._ingest_envelope_from_transport,
+                self._ingest_status_event_from_transport,
+            )
             return
 
         # HTTP transport (original path)
@@ -249,6 +253,120 @@ class A2AChannel(BaseChannel):
         if not ok:
             logger.warning("A2A transport ingest failed: {}", result.get("error"))
 
+    async def _ingest_status_event_from_transport(self, event: dict[str, Any]) -> None:
+        delegation_id_raw = event.get("delegation_id")
+        delegation_id = (
+            str(delegation_id_raw).strip()
+            if isinstance(delegation_id_raw, str)
+            else ""
+        )
+        if not delegation_id:
+            logger.warning("A2A status ingest skipped: missing delegation_id")
+            return
+
+        status_raw = event.get("status")
+        status = (
+            str(status_raw).strip().lower()
+            if isinstance(status_raw, str)
+            else ""
+        )
+        if not status:
+            logger.warning(
+                "A2A status ingest skipped: missing status delegation_id={}",
+                delegation_id,
+            )
+            return
+
+        from_agent_raw = event.get("from_agent")
+        from_agent = (
+            str(from_agent_raw).strip()
+            if isinstance(from_agent_raw, str)
+            else ""
+        )
+
+        payload_raw = event.get("payload")
+        payload = payload_raw if isinstance(payload_raw, dict) else {}
+
+        ok = self.bus.delegation.record_status_event(
+            delegation_id,
+            status=status,
+            from_agent=from_agent or None,
+            payload=payload,
+        )
+        if not ok:
+            logger.warning(
+                "A2A status ingest failed to record event delegation_id={} status={}",
+                delegation_id,
+                status,
+            )
+            return
+
+        task = self.bus.delegation.resolve({"delegation_id": delegation_id})
+        if task is not None:
+            task.updated_at = time.time()
+            task.metadata["remote_status"] = status
+            if from_agent:
+                task.metadata["remote_status_from_agent"] = from_agent
+            if payload:
+                task.metadata["remote_status_payload"] = payload
+
+        logger.debug(
+            "A2A status ingested delegation_id={} status={} from_agent={}",
+            delegation_id,
+            status,
+            from_agent or "",
+        )
+
+    def _derive_status_owner_from_metadata(self, metadata: dict[str, Any]) -> str | None:
+        """Resolve which agent should receive delegation status events."""
+        owner = metadata.get("delegation_owner_agent")
+        if isinstance(owner, str) and owner.strip():
+            return owner.strip()
+
+        raw_delegation = metadata.get("_delegation")
+        if isinstance(raw_delegation, dict):
+            owner = raw_delegation.get("owner_agent")
+            if isinstance(owner, str) and owner.strip():
+                return owner.strip()
+
+        raw_a2a = metadata.get("_a2a")
+        if isinstance(raw_a2a, dict):
+            owner = raw_a2a.get("from_agent")
+            if isinstance(owner, str) and owner.strip():
+                return owner.strip()
+
+        return None
+
+    async def _publish_delegation_status_event(
+        self,
+        owner_agent: str,
+        delegation_id: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish delegation lifecycle status to owner agent over broker transport."""
+        if self._transport is None:
+            return
+
+        try:
+            await self._transport.publish_status(owner_agent, {
+                "event_id": str(uuid.uuid4()),
+                "delegation_id": delegation_id,
+                "status": status,
+                "from_agent": self.config.agent_id,
+                "to_agent": owner_agent,
+                "timestamp": int(time.time()),
+                "payload": dict(payload or {}),
+            })
+        except Exception as exc:
+            logger.warning(
+                "A2A transport status publish failed owner='{}' delegation_id='{}' status='{}': {}",
+                owner_agent,
+                delegation_id,
+                status,
+                exc,
+            )
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send A2A message via broker transport or HTTP."""
         target_agent = msg.chat_id
@@ -257,6 +375,37 @@ class A2AChannel(BaseChannel):
             envelope = self._build_outbound_envelope(target_agent, msg, mode="push")
             try:
                 await self._transport.publish(target_agent, envelope)
+
+                metadata = envelope.get("metadata")
+                if isinstance(metadata, dict):
+                    owner_agent = self._derive_status_owner_from_metadata(metadata)
+                    delegation_id_raw = envelope.get("delegation_id")
+                    delegation_id = (
+                        str(delegation_id_raw).strip()
+                        if isinstance(delegation_id_raw, str)
+                        else ""
+                    )
+                    if owner_agent and delegation_id:
+                        try:
+                            await self._transport.publish_status(owner_agent, {
+                                "event_id": str(uuid.uuid4()),
+                                "delegation_id": delegation_id,
+                                "status": "dispatched",
+                                "from_agent": self.config.agent_id,
+                                "to_agent": owner_agent,
+                                "timestamp": int(time.time()),
+                                "payload": {
+                                    "target_agent": target_agent,
+                                    "message_type": envelope.get("message_type"),
+                                },
+                            })
+                        except Exception as status_exc:
+                            logger.warning(
+                                "A2A transport status publish failed owner='{}' delegation_id='{}': {}",
+                                owner_agent,
+                                delegation_id,
+                                status_exc,
+                            )
             except Exception as e:
                 logger.error("A2A transport send failed to '{}': {}", target_agent, e)
             return
@@ -765,14 +914,41 @@ class A2AChannel(BaseChannel):
         session_key = envelope.get("session_key")
         session_key_str = str(session_key) if isinstance(session_key, str) and session_key else None
 
-        await self._handle_message(
-            sender_id=sender,
-            chat_id=chat_id,
-            content=content,
-            media=media_list,
-            metadata=metadata,
-            session_key=session_key_str,
-        )
+        owner_agent = self._derive_status_owner_from_metadata(metadata)
+        if self._transport is not None and delegation_id and owner_agent:
+            await self._publish_delegation_status_event(
+                owner_agent,
+                delegation_id,
+                "running",
+                {"from_agent": sender, "phase": "ingest"},
+            )
+
+        try:
+            await self._handle_message(
+                sender_id=sender,
+                chat_id=chat_id,
+                content=content,
+                media=media_list,
+                metadata=metadata,
+                session_key=session_key_str,
+            )
+        except Exception as exc:
+            if self._transport is not None and delegation_id and owner_agent:
+                await self._publish_delegation_status_event(
+                    owner_agent,
+                    delegation_id,
+                    "failed",
+                    {"error": str(exc)},
+                )
+            return False, {"error": f"handler failed: {exc}"}
+
+        if self._transport is not None and delegation_id and owner_agent:
+            await self._publish_delegation_status_event(
+                owner_agent,
+                delegation_id,
+                "completed",
+                {"accepted": True, "message_id": envelope.get("message_id")},
+            )
 
         return True, {"accepted": True, "message_id": envelope.get("message_id")}
 
@@ -801,10 +977,12 @@ class A2AChannel(BaseChannel):
 
         metadata["delegation_id"] = delegation_id
         metadata.setdefault("delegation_task_id", delegation_id)
+        metadata.setdefault("delegation_owner_agent", self.config.agent_id)
 
         raw_delegation = metadata.get("_delegation")
         delegation_meta = raw_delegation if isinstance(raw_delegation, dict) else {}
         delegation_meta["delegation_id"] = delegation_id
+        delegation_meta.setdefault("owner_agent", self.config.agent_id)
         metadata["_delegation"] = delegation_meta
 
         envelope: dict[str, Any] = {
