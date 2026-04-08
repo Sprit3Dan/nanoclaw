@@ -385,7 +385,7 @@ class A2AChannel(BaseChannel):
                         if isinstance(delegation_id_raw, str)
                         else ""
                     )
-                    if owner_agent and delegation_id:
+                    if owner_agent and delegation_id and self.config.agent_id != owner_agent:
                         try:
                             await self._transport.publish_status(owner_agent, {
                                 "event_id": str(uuid.uuid4()),
@@ -915,7 +915,12 @@ class A2AChannel(BaseChannel):
         session_key_str = str(session_key) if isinstance(session_key, str) and session_key else None
 
         owner_agent = self._derive_status_owner_from_metadata(metadata)
-        if self._transport is not None and delegation_id and owner_agent:
+        if (
+            self._transport is not None
+            and delegation_id
+            and owner_agent
+            and self.config.agent_id != owner_agent
+        ):
             await self._publish_delegation_status_event(
                 owner_agent,
                 delegation_id,

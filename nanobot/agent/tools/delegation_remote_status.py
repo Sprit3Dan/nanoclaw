@@ -129,6 +129,11 @@ class DelegationRemoteStatusTool(Tool):
         status = str(event.get("status", "")).strip().lower()
         payload = event.get("payload")
         body = payload if isinstance(payload, dict) else {"value": payload}
+        result_file = event.get("result_file")
+        if not isinstance(result_file, str) or not result_file.strip():
+            metadata = task.metadata if isinstance(getattr(task, "metadata", None), dict) else {}
+            result_file = metadata.get("result_file")
+
         return {
             "ok": status in {"completed", "done"},
             "source": "broker",
@@ -136,6 +141,7 @@ class DelegationRemoteStatusTool(Tool):
             "status": status or "unknown",
             "from_agent": str(event.get("from_agent", "")).strip(),
             "updated_at": event.get("updated_at"),
+            "result_file": result_file if isinstance(result_file, str) and result_file.strip() else None,
             "body": body,
         }
 

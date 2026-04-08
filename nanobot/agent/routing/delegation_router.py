@@ -99,12 +99,6 @@ class DelegationRouter:
                         content=content,
                         metadata=response_metadata,
                     )
-                    self._delegation.record_status_event(
-                        delegation_id,
-                        status="completed",
-                        from_agent=str(msg.sender_id),
-                        payload={"phase": "route_response"},
-                    )
                     self._delegation.mark_completed(active_delegation.id)
                     return outbound
         else:

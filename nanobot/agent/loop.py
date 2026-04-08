@@ -25,6 +25,7 @@ from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTo
 from nanobot.agent.tools.delegate import DelegateTaskTool
 from nanobot.agent.tools.delegation_tasks import DelegationTasksTool
 from nanobot.agent.tools.delegation_remote_status import DelegationRemoteStatusTool
+from nanobot.agent.tools.delegation_result_get import DelegationResultGetTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -176,6 +177,7 @@ class AgentLoop:
         ))
         self.tools.register(DelegationTasksTool(delegation_map=self.bus.delegation_map))
         self.tools.register(DelegationRemoteStatusTool(delegation_map=self.bus.delegation_map))
+        self.tools.register(DelegationResultGetTool(delegation_map=self.bus.delegation_map))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -947,7 +949,24 @@ class AgentLoop:
         response_metadata = dict(msg.metadata or {})
         if resolved_reply_channel and resolved_reply_chat_id:
             if completion_delegation_id:
-                self.bus.delegation_map.mark_completed(completion_delegation_id)
+                completed_task = self.bus.delegation_map.get(completion_delegation_id)
+                if completed_task is not None:
+                    self.bus.delegation_map.record_status_event(
+                        completed_task.delegation_id,
+                        status="completed",
+                        from_agent=str(msg.sender_id),
+                        payload={"phase": "loop_emit"},
+                    )
+                self.bus.delegation_map.mark_completed(
+                    completion_delegation_id,
+                    result_content=final_content,
+                    result_metadata={
+                        "phase": "loop_emit",
+                        "from_sender_id": str(msg.sender_id),
+                        "source_channel": msg.channel,
+                        "source_chat_id": msg.chat_id,
+                    },
+                )
             return OutboundMessage(
                 channel=resolved_reply_channel,
                 chat_id=resolved_reply_chat_id,

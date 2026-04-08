@@ -72,6 +72,13 @@ class DelegationTaskMap:
         raw_audit_path = os.environ.get("NANOBOT_DELEGATION_AUDIT_JSONL", "memory/delegation_tasks.jsonl")
         self._audit_path = Path(raw_audit_path).expanduser()
 
+        raw_results_dir = os.environ.get("NANOBOT_DELEGATION_RESULTS_DIR", "memory/delegation_results")
+        self._results_dir = Path(raw_results_dir).expanduser()
+        try:
+            self._results_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.debug("delegation.results mkdir failed path={} err={}", self._results_dir, exc)
+
     def create(
         self,
         *,
@@ -245,16 +252,34 @@ class DelegationTaskMap:
         if not did or not st:
             return False
 
+        event_payload = dict(payload or {})
         event: dict[str, Any] = {
             "delegation_id": did,
             "status": st,
             "from_agent": (str(from_agent).strip() if isinstance(from_agent, str) else ""),
             "updated_at": time.time(),
-            "payload": dict(payload or {}),
+            "payload": event_payload,
         }
 
         with self._lock:
             self._status_by_delegation_id[did] = event
+
+        if st in {"completed", "done"} and event_payload:
+            result_path = self.persist_result(
+                did,
+                content=event_payload.get("content", event_payload.get("result", event_payload)),
+                metadata={"source": "status_event", "status": st, "from_agent": event["from_agent"]},
+            )
+            if result_path is not None:
+                result_file = str(result_path)
+                event["result_file"] = result_file
+                meta_raw = event_payload.get("metadata")
+                if isinstance(meta_raw, Mapping):
+                    meta = dict(meta_raw)
+                else:
+                    meta = {}
+                meta["result_file"] = result_file
+                event_payload["metadata"] = meta
 
         logger.debug(
             "delegation.status.record delegation_id={} status={} from_agent={}",
@@ -273,7 +298,61 @@ class DelegationTaskMap:
             event = self._status_by_delegation_id.get(did)
             return dict(event) if isinstance(event, dict) else None
 
-    def mark_completed(self, delegation_task_id: str) -> bool:
+    def result_path(self, delegation_id: str) -> Path:
+        """Return on-disk path for a delegation result snapshot."""
+        did = str(delegation_id).strip() or "unknown"
+        return self._results_dir / f"{did}.json"
+
+    def persist_result(
+        self,
+        delegation_id: str,
+        *,
+        content: Any,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Path | None:
+        """Persist full delegation result content keyed by delegation_id."""
+        did = str(delegation_id).strip()
+        if not did:
+            return None
+
+        row: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "delegation_id": did,
+            "content": content,
+            "metadata": dict(metadata or {}),
+        }
+        path = self.result_path(did)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(row, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            logger.debug("delegation.result.persisted delegation_id={} path={}", did, path)
+            return path
+        except Exception as exc:
+            logger.debug("delegation.result.persist_failed delegation_id={} err={}", did, exc)
+            return None
+
+    def load_result(self, delegation_id: str) -> dict[str, Any] | None:
+        """Load persisted delegation result content by delegation_id."""
+        path = self.result_path(delegation_id)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            logger.debug("delegation.result.load_failed path={} err={}", path, exc)
+            return None
+
+    def mark_completed(
+        self,
+        delegation_task_id: str,
+        *,
+        result_content: Any | None = None,
+        result_metadata: Mapping[str, Any] | None = None,
+    ) -> bool:
         local_id = str(delegation_task_id).strip()
         if not local_id:
             logger.debug("delegation.complete skipped empty local_id")
@@ -293,18 +372,28 @@ class DelegationTaskMap:
             task.updated_at = task.completed_at
             self._by_delegation_id.pop(task.delegation_id, None)
             self._status_by_delegation_id.pop(task.delegation_id, None)
-            logger.debug(
-                "delegation.complete local_id={} remote_id={} completed_at={}",
-                task.id,
-                task.delegated_task_id,
-                task.completed_at,
+
+        if result_content is not None:
+            result_path = self.persist_result(
+                task.delegation_id,
+                content=result_content,
+                metadata=result_metadata,
             )
-            self._append_audit_event(
-                "mark_completed",
-                task,
-                extra={"completed_at": task.completed_at},
-            )
-            return True
+            if result_path is not None:
+                task.metadata["result_file"] = str(result_path)
+
+        logger.debug(
+            "delegation.complete local_id={} remote_id={} completed_at={}",
+            task.id,
+            task.delegated_task_id,
+            task.completed_at,
+        )
+        self._append_audit_event(
+            "mark_completed",
+            task,
+            extra={"completed_at": task.completed_at, "result_file": task.metadata.get("result_file")},
+        )
+        return True
 
     def expire(self, *, older_than_seconds: int) -> int:
         """Expire active tasks older than a given age. Returns expired count."""
