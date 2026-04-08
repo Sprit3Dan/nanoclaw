@@ -43,7 +43,7 @@ class RabbitMQTransport(A2ATransport):
         exchange  ``{exchange}``          direct, durable
         queue     ``{queue_prefix}{id}``  durable, bound to exchange w/ routing_key=agent_id
 
-    Requires: ``aio-pika``  (pip install "nanobot-ai[a2a-rabbitmq]")
+    Requires: ``aio-pika`` (included in core ``nanobot-ai`` dependencies).
     """
 
     def __init__(
