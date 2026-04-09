@@ -355,6 +355,21 @@ class A2AChannel(BaseChannel):
                                 "payload": {
                                     "target_agent": target_agent,
                                     "message_type": envelope.get("message_type"),
+                                    "message_id": envelope.get("message_id"),
+                                },
+                            })
+                            await self._transport.publish_status(owner_agent, {
+                                "event_id": str(uuid.uuid4()),
+                                "delegation_id": delegation_id,
+                                "status": "done",
+                                "from_agent": self.config.agent_id,
+                                "to_agent": owner_agent,
+                                "timestamp": int(time.time()),
+                                "payload": {
+                                    "delivered": True,
+                                    "target_agent": target_agent,
+                                    "message_type": envelope.get("message_type"),
+                                    "message_id": envelope.get("message_id"),
                                 },
                             })
                         except Exception as status_exc:
@@ -873,25 +888,20 @@ class A2AChannel(BaseChannel):
         session_key_str = str(session_key) if isinstance(session_key, str) and session_key else None
 
         owner_agent = self._derive_status_owner_from_metadata(metadata)
+        owner_agent_id = owner_agent or ""
         _has_transport_status = (
             self._transport is not None
             and delegation_id
-            and owner_agent
-            and self.config.agent_id != owner_agent
+            and owner_agent_id
+            and self.config.agent_id != owner_agent_id
         )
 
         if _has_transport_status:
             await self._publish_delegation_status_event(
-                owner_agent,
+                owner_agent_id,
                 delegation_id,
                 "received",
                 {"from_agent": sender, "phase": "received"},
-            )
-            await self._publish_delegation_status_event(
-                owner_agent,
-                delegation_id,
-                "running",
-                {"from_agent": sender},
             )
 
         try:
@@ -906,20 +916,12 @@ class A2AChannel(BaseChannel):
         except Exception as exc:
             if _has_transport_status:
                 await self._publish_delegation_status_event(
-                    owner_agent,
+                    owner_agent_id,
                     delegation_id,
                     "failed",
                     {"error": str(exc)},
                 )
             return False, {"error": f"handler failed: {exc}"}
-
-        if _has_transport_status:
-            await self._publish_delegation_status_event(
-                owner_agent,
-                delegation_id,
-                "done",
-                {"accepted": True, "message_id": envelope.get("message_id")},
-            )
 
         return True, {"accepted": True, "message_id": envelope.get("message_id")}
 
