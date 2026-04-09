@@ -330,7 +330,7 @@ class DelegateTaskTool(Tool):
         if not agent_id:
             return None
 
-        # base_url is optional — absent for broker transports (RabbitMQ / EventBridge)
+        # base_url is optional — absent for broker transports (NATS)
         base_url_raw = (
             route.get("base_url")
             or payload.get("base_url")
@@ -382,11 +382,7 @@ class DelegateTaskTool(Tool):
         return _ResolvedRoute(agent_id=agent_id, base_url=base_url, host=host, port=port)
 
     async def on_agent_start(self) -> None:
-        """Eagerly register with the discovery service at agent startup.
-
-        If the discovery service returns an amqp_url, forward it to the A2A
-        channel so the RabbitMQ transport can connect with per-agent credentials.
-        """
+        """Eagerly register with the discovery service at agent startup."""
         discovery_base_url = self._normalize_discovery_base_url(
             str(os.environ.get("NANOBOT_DISCOVERY_BASE_URL", "")).strip()
         )
@@ -394,14 +390,9 @@ class DelegateTaskTool(Tool):
             return
         register_url = self._register_url_from_base(discovery_base_url)
         try:
-            amqp_url = await self._register_once(discovery_register_url=register_url)
+            await self._register_once(discovery_register_url=register_url)
         except Exception as exc:
             logger.warning("delegate_task.startup.register_failed error={}", exc)
-            return
-        if amqp_url:
-            from nanobot.channels.a2a import set_dynamic_broker_url
-            set_dynamic_broker_url(amqp_url)
-            logger.debug("delegate_task.startup.amqp_url_set agent_id={}", self._agent_id)
 
     def _build_capabilities(self) -> dict[str, Any]:
         """Derive A2A capabilities from workspace SKILL.md files.
@@ -462,8 +453,8 @@ class DelegateTaskTool(Tool):
 
         return caps
 
-    async def _register_once(self, discovery_register_url: str) -> str | None:
-        """Register with discovery. Returns amqp_url if the service provisioned one."""
+    async def _register_once(self, discovery_register_url: str) -> None:
+        """Register with the discovery service."""
         url = discovery_register_url.strip()
         if not url:
             raise ValueError("discovery_register_url is empty")
@@ -471,7 +462,7 @@ class DelegateTaskTool(Tool):
         async with self._register_lock:
             if url in self._registered_at:
                 logger.debug("delegate_task.register.cached register_url={}", url)
-                return None
+                return
 
             client = await self._ensure_http_client()
             capabilities = self._build_capabilities()
@@ -504,17 +495,7 @@ class DelegateTaskTool(Tool):
                 raise RuntimeError(f"register failed [{resp.status_code}]: {resp.text[:300]}")
 
             self._registered_at[url] = time.time()
-            try:
-                body = resp.json()
-                amqp_url = body.get("amqp_url") if isinstance(body, dict) else None
-            except Exception:
-                amqp_url = None
-            logger.debug(
-                "delegate_task.register.success url={} amqp_provisioned={}",
-                url,
-                amqp_url is not None,
-            )
-            return amqp_url if isinstance(amqp_url, str) and amqp_url else None
+            logger.debug("delegate_task.register.success url={}", url)
 
     def _advertised_base_url(self) -> str | None:
         # Explicit env override (recommended for Kubernetes service URL registration).

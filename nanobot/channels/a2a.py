@@ -29,32 +29,6 @@ from nanobot.channels.a2a_protocol import (
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
 
-# ---------------------------------------------------------------------------
-# Dynamic broker URL — set by DelegateTaskTool.on_agent_start() after the
-# discovery service provisions per-agent RabbitMQ credentials.
-# ---------------------------------------------------------------------------
-_dynamic_broker_url: str = ""
-_dynamic_broker_url_event: asyncio.Event | None = None
-
-
-def _get_broker_url_event() -> asyncio.Event:
-    global _dynamic_broker_url_event
-    if _dynamic_broker_url_event is None:
-        _dynamic_broker_url_event = asyncio.Event()
-    return _dynamic_broker_url_event
-
-
-def set_dynamic_broker_url(url: str) -> None:
-    """Called by DelegateTaskTool when discovery returns a provisioned AMQP URL."""
-    global _dynamic_broker_url
-    _dynamic_broker_url = url
-    _get_broker_url_event().set()
-
-
-async def _wait_for_dynamic_broker_url(timeout: float = 30.0) -> str:
-    await asyncio.wait_for(_get_broker_url_event().wait(), timeout=timeout)
-    return _dynamic_broker_url
-
 _STATUS_TEXT = {
     200: "OK",
     201: "Created",
@@ -77,8 +51,8 @@ class A2AConfig(Base):
     enabled: bool = False
     agent_id: str = "agent"
 
-    # Transport backend: "http" (default) or "rabbitmq"
-    transport_backend: Literal["http", "rabbitmq"] = "http"
+    # Transport backend: "http" (default) or "nats"
+    transport_backend: Literal["http", "nats"] = "http"
 
     # HTTP transport
     listen_host: str = "0.0.0.0"
@@ -96,10 +70,10 @@ class A2AConfig(Base):
     sse_timeout_s: float = 60.0
     sse_heartbeat_seconds: int = 10
 
-    # RabbitMQ transport
-    rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
-    rabbitmq_exchange: str = "a2a"
-    rabbitmq_queue_prefix: str = "a2a."
+    # NATS JetStream transport (aligns with webagent subject topology)
+    nats_url: str = "nats://localhost:4222"
+    nats_stream_name: str = "a2a"
+    nats_subject_prefix: str = "a2a"
 
     # Security (all transports)
     require_auth: bool = False
@@ -151,14 +125,12 @@ class A2AChannel(BaseChannel):
         self._peer_routes: dict[str, tuple[str, float]] = {}
 
     def _build_transport(self):
-        if self.config.transport_backend == "rabbitmq":
-            from nanobot.channels.a2a_transport import RabbitMQTransport
-            # URL resolved later in start() — placeholder default here.
-            url = os.environ.get("NANOBOT_A2A_RABBITMQ_URL") or self.config.rabbitmq_url
-            return RabbitMQTransport(
-                url=url,
-                exchange=self.config.rabbitmq_exchange,
-                queue_prefix=self.config.rabbitmq_queue_prefix,
+        if self.config.transport_backend == "nats":
+            from nanobot.channels.a2a_transport import NatsJetStreamTransport
+            return NatsJetStreamTransport(
+                nats_url=os.environ.get("NANOBOT_A2A_NATS_URL") or self.config.nats_url,
+                stream_name=self.config.nats_stream_name,
+                subject_prefix=self.config.nats_subject_prefix,
             )
         return None  # HTTP mode
 
@@ -178,20 +150,6 @@ class A2AChannel(BaseChannel):
         self._nonce_gc_task = asyncio.create_task(self._nonce_gc_loop())
 
         if self._transport is not None:
-            # For dynamic credentials: if no static URL was baked in, wait for
-            # on_agent_start() to deliver the provisioned AMQP URL from discovery.
-            static_url = os.environ.get("NANOBOT_A2A_RABBITMQ_URL", "").strip()
-            if not static_url and self.config.transport_backend == "rabbitmq":
-                try:
-                    dynamic_url = await _wait_for_dynamic_broker_url(timeout=30.0)
-                    self._transport._url = dynamic_url  # patch before connect
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "A2A RabbitMQ: timed out waiting for AMQP URL from discovery — "
-                        "set RABBITMQ_ADMIN_URL on the discovery service or "
-                        "NANOBOT_A2A_RABBITMQ_URL on this agent"
-                    )
-                    return
             logger.info(
                 "Starting A2A channel as '{}' via {} transport",
                 self.config.agent_id,
@@ -915,17 +873,25 @@ class A2AChannel(BaseChannel):
         session_key_str = str(session_key) if isinstance(session_key, str) and session_key else None
 
         owner_agent = self._derive_status_owner_from_metadata(metadata)
-        if (
+        _has_transport_status = (
             self._transport is not None
             and delegation_id
             and owner_agent
             and self.config.agent_id != owner_agent
-        ):
+        )
+
+        if _has_transport_status:
             await self._publish_delegation_status_event(
                 owner_agent,
                 delegation_id,
                 "received",
                 {"from_agent": sender, "phase": "received"},
+            )
+            await self._publish_delegation_status_event(
+                owner_agent,
+                delegation_id,
+                "running",
+                {"from_agent": sender},
             )
 
         try:
@@ -938,7 +904,7 @@ class A2AChannel(BaseChannel):
                 session_key=session_key_str,
             )
         except Exception as exc:
-            if self._transport is not None and delegation_id and owner_agent:
+            if _has_transport_status:
                 await self._publish_delegation_status_event(
                     owner_agent,
                     delegation_id,
@@ -946,6 +912,14 @@ class A2AChannel(BaseChannel):
                     {"error": str(exc)},
                 )
             return False, {"error": f"handler failed: {exc}"}
+
+        if _has_transport_status:
+            await self._publish_delegation_status_event(
+                owner_agent,
+                delegation_id,
+                "done",
+                {"accepted": True, "message_id": envelope.get("message_id")},
+            )
 
         return True, {"accepted": True, "message_id": envelope.get("message_id")}
 
