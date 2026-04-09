@@ -238,6 +238,19 @@ class DelegateTaskTool(Tool):
             local_delegation_bound,
             bool(origin_channel and origin_chat_id),
         )
+
+        if delegation_queue:
+            delegation_queue.record_status_event(
+                delegation_id,
+                status="dispatched",
+                from_agent=self._agent_id,
+                payload={
+                    "phase": "delegate_task.dispatch",
+                    "target_agent": chat_id,
+                    "mode": mode_l,
+                },
+            )
+
         await self._send_callback(msg)
         logger.debug("delegate_task.dispatch.sent delegation_id={} chat_id={}", delegation_id, chat_id)
 

@@ -17,9 +17,9 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.a2a_protocol import (
-    A2AEnvelopePolicy,
     MESSAGE_TYPE_DELEGATION_REQUEST,
     PROTOCOL,
+    A2AEnvelopePolicy,
     join_url,
     make_auth,
     normalize_base_url,
@@ -27,6 +27,7 @@ from nanobot.channels.a2a_protocol import (
     validate_inbound_envelope,
 )
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.delegation_status_machine import DelegationStatusMachine
 from nanobot.config.schema import Base
 
 _STATUS_TEXT = {
@@ -110,6 +111,7 @@ class A2AChannel(BaseChannel):
         self.config: A2AConfig = config
 
         self._transport = self._build_transport()
+        self._status_machine = DelegationStatusMachine()
 
         self._server: asyncio.base_events.Server | None = None
         self._client: httpx.AsyncClient | None = None
@@ -245,9 +247,29 @@ class A2AChannel(BaseChannel):
         payload_raw = event.get("payload")
         payload = payload_raw if isinstance(payload_raw, dict) else {}
 
+        transition = self._status_machine.apply_status_event(
+            {
+                "delegation_id": delegation_id,
+                "status": status,
+                "from_agent": from_agent,
+                "to_agent": self.config.agent_id,
+                "payload": payload,
+            },
+            source="transport.status_event",
+        )
+        if transition is None:
+            logger.warning(
+                "A2A status ingest skipped invalid transition delegation_id={} status={}",
+                delegation_id,
+                status,
+            )
+            return
+
+        status_now = transition.current_status
+
         ok = self.bus.delegation.record_status_event(
             delegation_id,
-            status=status,
+            status=status_now,
             from_agent=from_agent or None,
             payload=payload,
         )
@@ -255,24 +277,25 @@ class A2AChannel(BaseChannel):
             logger.warning(
                 "A2A status ingest failed to record event delegation_id={} status={}",
                 delegation_id,
-                status,
+                status_now,
             )
             return
 
         task = self.bus.delegation.resolve({"delegation_id": delegation_id})
         if task is not None:
             task.updated_at = time.time()
-            task.metadata["remote_status"] = status
+            task.metadata["remote_status"] = status_now
             if from_agent:
                 task.metadata["remote_status_from_agent"] = from_agent
             if payload:
                 task.metadata["remote_status_payload"] = payload
 
         logger.debug(
-            "A2A status ingested delegation_id={} status={} from_agent={}",
+            "A2A status ingested delegation_id={} status={} from_agent={} changed={}",
             delegation_id,
-            status,
+            status_now,
             from_agent or "",
+            transition.changed,
         )
 
     def _derive_status_owner_from_metadata(self, metadata: dict[str, Any]) -> str | None:
@@ -331,56 +354,101 @@ class A2AChannel(BaseChannel):
 
         if self._transport is not None:
             envelope = self._build_outbound_envelope(target_agent, msg, mode="push")
+            metadata = envelope.get("metadata")
+            owner_agent = None
+            delegation_id = ""
+            emit_done_status = False
+            if isinstance(metadata, dict):
+                owner_agent = self._derive_status_owner_from_metadata(metadata)
+                emit_done_status = bool(metadata.pop("_a2a_emit_done_status", False))
+                done_delegation_id_raw = metadata.pop("_a2a_done_delegation_id", None)
+                delegation_id_raw = (
+                    done_delegation_id_raw
+                    if emit_done_status and isinstance(done_delegation_id_raw, str)
+                    else envelope.get("delegation_id")
+                )
+                delegation_id = (
+                    str(delegation_id_raw).strip()
+                    if isinstance(delegation_id_raw, str)
+                    else ""
+                )
+
             try:
+                if owner_agent and delegation_id and self.config.agent_id != owner_agent:
+                    self._status_machine.mark_dispatched(
+                        delegation_id,
+                        origin_agent=owner_agent,
+                        target_agent=target_agent,
+                        source="transport.publish.dispatched.local",
+                        payload={
+                            "target_agent": target_agent,
+                            "message_type": envelope.get("message_type"),
+                            "message_id": envelope.get("message_id"),
+                        },
+                    )
+
                 await self._transport.publish(target_agent, envelope)
 
-                metadata = envelope.get("metadata")
-                if isinstance(metadata, dict):
-                    owner_agent = self._derive_status_owner_from_metadata(metadata)
-                    delegation_id_raw = envelope.get("delegation_id")
-                    delegation_id = (
-                        str(delegation_id_raw).strip()
-                        if isinstance(delegation_id_raw, str)
-                        else ""
-                    )
-                    if owner_agent and delegation_id and self.config.agent_id != owner_agent:
-                        try:
-                            await self._transport.publish_status(owner_agent, {
-                                "event_id": str(uuid.uuid4()),
-                                "delegation_id": delegation_id,
-                                "status": "dispatched",
-                                "from_agent": self.config.agent_id,
-                                "to_agent": owner_agent,
-                                "timestamp": int(time.time()),
-                                "payload": {
-                                    "target_agent": target_agent,
-                                    "message_type": envelope.get("message_type"),
-                                    "message_id": envelope.get("message_id"),
-                                },
-                            })
-                            await self._transport.publish_status(owner_agent, {
-                                "event_id": str(uuid.uuid4()),
-                                "delegation_id": delegation_id,
-                                "status": "done",
-                                "from_agent": self.config.agent_id,
-                                "to_agent": owner_agent,
-                                "timestamp": int(time.time()),
-                                "payload": {
-                                    "delivered": True,
-                                    "target_agent": target_agent,
-                                    "message_type": envelope.get("message_type"),
-                                    "message_id": envelope.get("message_id"),
-                                },
-                            })
-                        except Exception as status_exc:
-                            logger.warning(
-                                "A2A transport status publish failed owner='{}' delegation_id='{}': {}",
+                if (
+                    emit_done_status
+                    and owner_agent
+                    and delegation_id
+                    and self.config.agent_id != owner_agent
+                ):
+                    try:
+                        done_payload = {
+                            "delivered": True,
+                            "target_agent": target_agent,
+                            "message_type": envelope.get("message_type"),
+                            "message_id": envelope.get("message_id"),
+                            "phase": "loop_emit",
+                        }
+                        done_transition, _done_event = self._status_machine.mark_done(
+                            delegation_id,
+                            local_agent=self.config.agent_id,
+                            origin_agent=owner_agent,
+                            source="transport.publish.done",
+                            payload=done_payload,
+                        )
+                        if done_transition.changed:
+                            await self._publish_delegation_status_event(
                                 owner_agent,
                                 delegation_id,
-                                status_exc,
+                                "done",
+                                done_payload,
                             )
+                    except Exception as status_exc:
+                        logger.warning(
+                            "A2A transport status publish failed owner='{}' delegation_id='{}': {}",
+                            owner_agent,
+                            delegation_id,
+                            status_exc,
+                        )
             except Exception as e:
                 logger.error("A2A transport send failed to '{}': {}", target_agent, e)
+                if owner_agent and delegation_id and self.config.agent_id != owner_agent:
+                    try:
+                        await self._transport.publish_status(owner_agent, {
+                            "event_id": str(uuid.uuid4()),
+                            "delegation_id": delegation_id,
+                            "status": "failed",
+                            "from_agent": self.config.agent_id,
+                            "to_agent": owner_agent,
+                            "timestamp": int(time.time()),
+                            "payload": {
+                                "target_agent": target_agent,
+                                "message_type": envelope.get("message_type"),
+                                "message_id": envelope.get("message_id"),
+                                "error": str(e),
+                            },
+                        })
+                    except Exception as status_exc:
+                        logger.warning(
+                            "A2A transport failed-status publish failed owner='{}' delegation_id='{}': {}",
+                            owner_agent,
+                            delegation_id,
+                            status_exc,
+                        )
             return
 
         # HTTP transport path
@@ -865,6 +933,8 @@ class A2AChannel(BaseChannel):
         if delegation_id:
             metadata["delegation_id"] = delegation_id
 
+        metadata.setdefault("delegation_owner_agent", sender)
+
         metadata["_a2a"] = {
             "message_id": envelope.get("message_id"),
             "message_type": envelope.get("message_type"),
@@ -877,6 +947,13 @@ class A2AChannel(BaseChannel):
             "mode": envelope.get("mode"),
             "reply_to_base": reply_to_base,
         }
+
+        raw_delegation = metadata.get("_delegation")
+        delegation_meta = raw_delegation if isinstance(raw_delegation, dict) else {}
+        if delegation_id:
+            delegation_meta["delegation_id"] = delegation_id
+        delegation_meta.setdefault("owner_agent", sender)
+        metadata["_delegation"] = delegation_meta
 
         if isinstance(reply_to_base, str) and reply_to_base.strip():
             self._remember_peer_route(sender, reply_to_base)
@@ -897,12 +974,20 @@ class A2AChannel(BaseChannel):
         )
 
         if _has_transport_status:
-            await self._publish_delegation_status_event(
-                owner_agent_id,
+            received_transition, _received_event = self._status_machine.mark_received(
                 delegation_id,
-                "received",
-                {"from_agent": sender, "phase": "received"},
+                local_agent=self.config.agent_id,
+                origin_agent=owner_agent_id,
+                source="ingest.received",
+                payload={"from_agent": sender, "phase": "received"},
             )
+            if received_transition.changed:
+                await self._publish_delegation_status_event(
+                    owner_agent_id,
+                    delegation_id,
+                    "received",
+                    {"from_agent": sender, "phase": "received"},
+                )
 
         try:
             await self._handle_message(
