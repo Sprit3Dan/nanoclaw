@@ -901,6 +901,37 @@ class AgentLoop:
                 resolved_reply_chat_id = active_delegation.reply_chat_id
                 completion_delegation_id = active_delegation.id
 
+        if resolved_reply_channel and resolved_reply_chat_id:
+            response_metadata = dict(msg.metadata or {})
+            forwarded_content = msg.content or ""
+
+            if completion_delegation_id:
+                completed_task = self.bus.delegation_map.get(completion_delegation_id)
+                if completed_task is not None:
+                    self.bus.delegation_map.record_status_event(
+                        completed_task.delegation_id,
+                        status="completed",
+                        from_agent=str(msg.sender_id),
+                        payload={"phase": "loop_short_circuit"},
+                    )
+                self.bus.delegation_map.mark_completed(
+                    completion_delegation_id,
+                    result_content=forwarded_content,
+                    result_metadata={
+                        "phase": "loop_short_circuit",
+                        "from_sender_id": str(msg.sender_id),
+                        "source_channel": msg.channel,
+                        "source_chat_id": msg.chat_id,
+                    },
+                )
+
+            return OutboundMessage(
+                channel=resolved_reply_channel,
+                chat_id=resolved_reply_chat_id,
+                content=forwarded_content,
+                metadata=response_metadata,
+            )
+
         tool_channel, tool_chat_id = self.delegation_router.resolve_tool_target(msg)
 
         self._set_tool_context(tool_channel, tool_chat_id, msg_meta.get("message_id"))
@@ -947,32 +978,6 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         response_metadata = dict(msg.metadata or {})
-        if resolved_reply_channel and resolved_reply_chat_id:
-            if completion_delegation_id:
-                completed_task = self.bus.delegation_map.get(completion_delegation_id)
-                if completed_task is not None:
-                    self.bus.delegation_map.record_status_event(
-                        completed_task.delegation_id,
-                        status="completed",
-                        from_agent=str(msg.sender_id),
-                        payload={"phase": "loop_emit"},
-                    )
-                self.bus.delegation_map.mark_completed(
-                    completion_delegation_id,
-                    result_content=final_content,
-                    result_metadata={
-                        "phase": "loop_emit",
-                        "from_sender_id": str(msg.sender_id),
-                        "source_channel": msg.channel,
-                        "source_chat_id": msg.chat_id,
-                    },
-                )
-            return OutboundMessage(
-                channel=resolved_reply_channel,
-                chat_id=resolved_reply_chat_id,
-                content=final_content,
-                metadata=response_metadata,
-            )
 
         return self.delegation_router.route_response(
             msg=msg,
