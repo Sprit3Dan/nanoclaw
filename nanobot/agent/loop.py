@@ -215,18 +215,23 @@ class AgentLoop:
             except Exception as exc:
                 logger.warning("startup hook failed for tool '{}': {}", tool.name, exc)
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
 
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if isinstance(tool, _ContextAwareTool):
                     ctx_tool = cast(_ContextAwareTool, tool)
-                    ctx_tool.set_context(
-                        channel,
-                        chat_id,
-                        *([message_id] if name == "message" else []),
-                    )
+                    if name == "message":
+                        ctx_tool.set_context(channel, chat_id, message_id, metadata or {})
+                    else:
+                        ctx_tool.set_context(channel, chat_id)
 
         # Delegate tool uses explicit context injection (no execute monkey-patching).
         if delegate_tool := self.tools.get("delegate_task"):
@@ -830,7 +835,12 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                msg.metadata or {},
+            )
             history = session.get_history(max_messages=0)
             # Subagent results should be assistant role, other system messages use user role
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -926,7 +936,12 @@ class AgentLoop:
 
         tool_channel, tool_chat_id = self.delegation_router.resolve_tool_target(msg)
 
-        self._set_tool_context(tool_channel, tool_chat_id, msg_meta.get("message_id"))
+        self._set_tool_context(
+            tool_channel,
+            tool_chat_id,
+            msg_meta.get("message_id"),
+            msg_meta,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()

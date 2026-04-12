@@ -23,13 +23,21 @@ class MessageTool(Tool):
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
+        self._default_metadata: dict[str, Any] = {}
         self._sent_in_turn: bool = False
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Set the current message context."""
         self._default_channel = channel
         self._default_chat_id = chat_id
         self._default_message_id = message_id
+        self._default_metadata = dict(metadata or {})
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -101,14 +109,16 @@ class MessageTool(Tool):
             if isinstance(m, str) and m.strip()
         )
 
+        out_meta = dict(self._default_metadata)
+        if message_id:
+            out_meta["message_id"] = message_id
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
             media=list(normalized_media),
-            metadata={
-                "message_id": message_id,
-            },
+            metadata=out_meta,
         )
 
         try:
