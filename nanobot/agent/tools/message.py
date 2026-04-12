@@ -73,7 +73,11 @@ class MessageTool(Tool):
                 },
                 "chat_id": {
                     "type": "string",
-                    "description": "Optional: target chat/user ID"
+                    "description": "Optional: target chat/user ID (for channel='a2a' this is pinned to inbound sender unless override is allowed)"
+                },
+                "allow_a2a_chat_override": {
+                    "type": "boolean",
+                    "description": "Optional: allow explicit chat_id override when channel is a2a"
                 },
                 "media": {
                     "type": "array",
@@ -86,8 +90,10 @@ class MessageTool(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         content = kwargs.get("content")
-        channel = kwargs.get("channel") or self._default_channel
-        chat_id = kwargs.get("chat_id") or self._default_chat_id
+        requested_channel = kwargs.get("channel")
+        requested_chat_id = kwargs.get("chat_id")
+        channel = requested_channel or self._default_channel
+        chat_id = requested_chat_id or self._default_chat_id
         message_id = kwargs.get("message_id") or self._default_message_id
         media = kwargs.get("media")
 
@@ -95,6 +101,26 @@ class MessageTool(Tool):
             return "Error: Missing required parameter 'content'"
 
         content = str(content)
+
+        if channel == "a2a":
+            raw_a2a = self._default_metadata.get("_a2a")
+            a2a_ctx = raw_a2a if isinstance(raw_a2a, dict) else {}
+            pinned_chat_id = str(a2a_ctx.get("from_agent") or "").strip()
+
+            allow_override_raw = kwargs.get("allow_a2a_chat_override")
+            if allow_override_raw is None:
+                allow_override_raw = self._default_metadata.get("allow_a2a_chat_override")
+
+            allow_override = (
+                allow_override_raw is True
+                or (
+                    isinstance(allow_override_raw, str)
+                    and allow_override_raw.strip().lower() in {"1", "true", "yes", "on"}
+                )
+            )
+
+            if pinned_chat_id and not allow_override:
+                chat_id = pinned_chat_id
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"

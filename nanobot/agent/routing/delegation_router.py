@@ -75,7 +75,9 @@ class DelegationRouter:
           2) If a correlated delegation task exists, route to its reply target and mark completed.
           3) Otherwise, fallback to replying over A2A to the sender agent.
         """
-        response_metadata = dict(metadata or msg.metadata or {})
+        response_metadata = dict(msg.metadata or {})
+        if metadata:
+            response_metadata.update(metadata)
 
         if msg.channel != "a2a":
             return OutboundMessage(
@@ -102,7 +104,9 @@ class DelegationRouter:
                     self._delegation.mark_completed(active_delegation.id)
                     return outbound
         else:
-            delegation_id = uuid.uuid4().hex
+            delegation_id = self._extract_delegation_id(dict(msg.metadata or {}))
+            if not delegation_id:
+                delegation_id = uuid.uuid4().hex
 
 
 

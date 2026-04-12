@@ -236,7 +236,7 @@ class AgentLoop:
         # Delegate tool uses explicit context injection (no execute monkey-patching).
         if delegate_tool := self.tools.get("delegate_task"):
             if isinstance(delegate_tool, DelegateTaskTool):
-                delegate_tool.set_context(channel, chat_id)
+                delegate_tool.set_context(channel, chat_id, metadata or {})
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:

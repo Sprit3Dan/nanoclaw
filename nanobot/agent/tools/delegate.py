@@ -54,11 +54,18 @@ class DelegateTaskTool(Tool):
         self._http_client: httpx.AsyncClient | None = None
         self._origin_channel: str = ""
         self._origin_chat_id: str = ""
+        self._origin_metadata: dict[str, Any] = {}
 
-    def set_context(self, origin_channel: str, origin_chat_id: str) -> None:
+    def set_context(
+        self,
+        origin_channel: str,
+        origin_chat_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Set default origin routing context for delegation calls."""
         self._origin_channel = str(origin_channel or "").strip()
         self._origin_chat_id = str(origin_chat_id or "").strip()
+        self._origin_metadata = dict(metadata or {})
 
     @property
     def name(self) -> str:
@@ -144,9 +151,28 @@ class DelegateTaskTool(Tool):
         if not origin_chat_id:
             origin_chat_id = self._origin_chat_id
 
-        # Keep contract explicit but auto-generated to minimize tool-call parameters.
+        # Keep contract explicit but preserve upstream delegation correlation when present.
         message_type = "delegation_request"
-        delegation_id = uuid.uuid4().hex
+        delegation_id = ""
+        raw_delegation_id = kwargs.get("delegation_id")
+        if isinstance(raw_delegation_id, str):
+            delegation_id = raw_delegation_id.strip()
+
+        if not delegation_id:
+            delegation_id = str(self._origin_metadata.get("delegation_id") or "").strip()
+
+        if not delegation_id:
+            raw_a2a = self._origin_metadata.get("_a2a")
+            a2a_meta = raw_a2a if isinstance(raw_a2a, dict) else {}
+            delegation_id = str(a2a_meta.get("delegation_id") or "").strip()
+
+        if not delegation_id:
+            raw_delegation = self._origin_metadata.get("_delegation")
+            delegation_meta = raw_delegation if isinstance(raw_delegation, dict) else {}
+            delegation_id = str(delegation_meta.get("delegation_id") or "").strip()
+
+        if not delegation_id:
+            delegation_id = uuid.uuid4().hex
 
         register_url = self._register_url_from_base(discovery_base_url)
         logger.debug(
