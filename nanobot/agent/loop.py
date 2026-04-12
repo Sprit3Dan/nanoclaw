@@ -906,8 +906,7 @@ class AgentLoop:
             forwarded_content = msg.content or ""
 
             if completion_delegation_id:
-                completed_task = self.bus.delegation_map.get(completion_delegation_id)
-                completion_marked = self.bus.delegation_map.mark_completed(
+                self.bus.delegation_map.mark_completed(
                     completion_delegation_id,
                     result_content=forwarded_content,
                     result_metadata={
@@ -917,10 +916,6 @@ class AgentLoop:
                         "source_chat_id": msg.chat_id,
                     },
                 )
-
-                if completed_task is not None and completion_marked:
-                    response_metadata["_a2a_emit_done_status"] = True
-                    response_metadata["_a2a_done_delegation_id"] = completed_task.delegation_id
 
             return OutboundMessage(
                 channel=resolved_reply_channel,

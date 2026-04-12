@@ -360,13 +360,13 @@ class A2AChannel(BaseChannel):
             emit_done_status = False
             if isinstance(metadata, dict):
                 owner_agent = self._derive_status_owner_from_metadata(metadata)
-                emit_done_status = bool(metadata.pop("_a2a_emit_done_status", False))
-                done_delegation_id_raw = metadata.pop("_a2a_done_delegation_id", None)
-                delegation_id_raw = (
-                    done_delegation_id_raw
-                    if emit_done_status and isinstance(done_delegation_id_raw, str)
-                    else envelope.get("delegation_id")
-                )
+
+                raw_a2a_ctx = metadata.get("_a2a")
+                has_a2a_context = isinstance(raw_a2a_ctx, dict)
+                is_progress_update = bool(metadata.get("_progress"))
+                emit_done_status = has_a2a_context and not is_progress_update
+
+                delegation_id_raw = envelope.get("delegation_id")
                 delegation_id = (
                     str(delegation_id_raw).strip()
                     if isinstance(delegation_id_raw, str)
