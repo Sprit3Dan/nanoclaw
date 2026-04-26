@@ -30,6 +30,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.vision import VisionAnalyzeTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -181,6 +182,11 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        if self.vl_provider is not self.provider:
+            self._vision_context_updates: dict[str, str] = {}
+            self.tools.register(VisionAnalyzeTool(
+                self.vl_provider, self.vl_model, self._vision_context_updates,
+            ))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -237,6 +243,98 @@ class AgentLoop:
         if delegate_tool := self.tools.get("delegate_task"):
             if isinstance(delegate_tool, DelegateTaskTool):
                 delegate_tool.set_context(channel, chat_id, metadata or {})
+
+    @staticmethod
+    def _inline_vision_descriptions(
+        messages: list[dict[str, Any]],
+        updates: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Replace image path hints in user messages with stored VL descriptions.
+
+        Called after the agent loop when vision_analyze was invoked with
+        update_context=True.  Scans all user messages for hint lines that
+        reference paths present in `updates` and substitutes the description
+        inline, so future turns read clean text rather than stale placeholders.
+        """
+        if not updates:
+            return messages
+
+        result = []
+        for msg in messages:
+            if msg.get("role") != "user":
+                result.append(msg)
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                result.append(msg)
+                continue
+            new_content = content
+            for path, description in updates.items():
+                if path in new_content:
+                    # Replace the per-path hint line with the description
+                    new_content = new_content.replace(
+                        f"  - {path}",
+                        f"  - {path}: {description}",
+                    )
+            if new_content != content:
+                msg = {**msg, "content": new_content}
+            result.append(msg)
+        return result
+
+    @staticmethod
+    def _strip_one_image_message(message: dict[str, Any], idx: int) -> dict[str, Any]:
+        """Strip image_url blocks from a single user message dict, returning a copy."""
+        content = message.get("content")
+        if not isinstance(content, list):
+            return message
+
+        image_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "image_url"]
+        if not image_blocks:
+            return message
+
+        paths = [
+            b.get("_meta", {}).get("path", f"image_{i + 1}")
+            for i, b in enumerate(image_blocks)
+        ]
+        hint_lines = "\n".join(f"  - {p}" for p in paths)
+        hint = f"[{len(image_blocks)} image(s) — use vision_analyze to analyze:\n{hint_lines}\n]"
+
+        text_parts = [
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        user_text = " ".join(text_parts).strip()
+        new_content = f"{hint}\n\n{user_text}" if user_text else hint
+        return {**message, "content": new_content}
+
+    def _strip_images_for_text_model(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Replace image_url blocks with file-path hints across all user messages.
+
+        When a dedicated VL provider is configured, raw images must not reach the
+        primary model — it's text-only and will either error or silently ignore them.
+        All user messages in the context are scanned (not just the latest) so that
+        images accumulated across many turns don't leak through on subsequent turns.
+        """
+        if self.vl_provider is self.provider:
+            return messages
+
+        stripped: list[dict[str, Any]] = []
+        total = 0
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user":
+                new_msg = self._strip_one_image_message(msg, i)
+                stripped.append(new_msg)
+                if new_msg is not msg:
+                    total += 1
+            else:
+                stripped.append(msg)
+
+        if total:
+            logger.debug("Stripped image blocks from {} user message(s) for text-only primary model", total)
+        return stripped
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -514,18 +612,11 @@ class AgentLoop:
             return override.strip()
 
         primary_desc = "default choice, questions, tool calls, low level effort reasoning"
-        vision_desc = "describe images, OCR, screenshots, diagrams, and other visual understanding tasks"
         secondary_desc = "hardcore reasoning, deep problem solving, and complex multi-step technical analysis"
 
         route_descriptions = getattr(cfg, "route_descriptions", None) if cfg is not None else None
         if isinstance(route_descriptions, dict):
             primary_desc = route_descriptions.get("primary") or route_descriptions.get("custom") or primary_desc
-            vision_desc = (
-                route_descriptions.get("vision")
-                or route_descriptions.get("vl")
-                or route_descriptions.get("custom_vl")
-                or vision_desc
-            )
             secondary_desc = (
                 route_descriptions.get("secondary")
                 or route_descriptions.get("reasoning")
@@ -537,12 +628,6 @@ class AgentLoop:
                 or getattr(route_descriptions, "custom", None)
                 or primary_desc
             )
-            vision_desc = (
-                getattr(route_descriptions, "vision", None)
-                or getattr(route_descriptions, "vl", None)
-                or getattr(route_descriptions, "custom_vl", None)
-                or vision_desc
-            )
             secondary_desc = (
                 getattr(route_descriptions, "secondary", None)
                 or getattr(route_descriptions, "reasoning", None)
@@ -550,14 +635,12 @@ class AgentLoop:
             )
 
         primary_pct = int(round(self._routing_primary_share() * 100))
-        vision_note = f"- Route to vision for: {vision_desc}.\n"
         secondary_note = f"- Route to secondary for: {secondary_desc}.\n"
         flag_note = self._routing_flag_notes()
         return (
             "You are a routing classifier for an AI assistant.\n"
-            "Output exactly one label: primary, vision, or secondary.\n"
+            "Output exactly one label: primary or secondary.\n"
             f"- Route to primary for: {primary_desc}. This should be the dominant route (~{primary_pct}%).\n"
-            f"{vision_note}"
             f"{secondary_note}"
             f"{flag_note}"
             "Do not explain. Return one label only."
@@ -695,8 +778,6 @@ class AgentLoop:
             logger.warning("Router model failed, defaulting to primary route: {}", e)
             return default_provider, default_model, default_label
 
-        if route == "vision" and self._is_route_available(self.vl_provider, self.vl_model):
-            return self._route_target("vision")
         if route == "secondary" and self._is_route_available(self.reasoning_provider, self.reasoning_model):
             return self._route_target("secondary")
         return default_provider, default_model, default_label
@@ -954,6 +1035,10 @@ class AgentLoop:
             channel=tool_channel, chat_id=tool_chat_id,
             metadata=msg_meta,
         )
+        initial_messages = self._strip_images_for_text_model(initial_messages)
+
+        vision_updates = getattr(self, "_vision_context_updates", {})
+        vision_updates.clear()
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -966,6 +1051,7 @@ class AgentLoop:
         final_content, _, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
+        all_msgs = self._inline_vision_descriptions(all_msgs, vision_updates)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
