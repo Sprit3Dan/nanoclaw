@@ -58,7 +58,7 @@ class RoutingExample(Base):
     """One optional routing example for few-shot steering."""
 
     input: str = ""
-    route: Literal["custom", "custom_vl", "reasoning"] = "custom"
+    route: Literal["primary", "vision", "secondary"] = "primary"
 
 
 class RouteDescriptions(Base):
