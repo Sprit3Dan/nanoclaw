@@ -42,8 +42,9 @@ class AgentDefaults(Base):
     reasoning_fallback_provider: str | None = None  # Provider for `reasoning_fallback_model`
     max_tokens: int = 8192
     context_window_tokens: int = 65_536
+    memory_consolidation_ratio: float = 0.85  # Consolidate when prompt reaches this fraction of context window
     temperature: float = 0.1
-    max_tool_iterations: int = 40
+    max_tool_iterations: int = 100
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
 
 

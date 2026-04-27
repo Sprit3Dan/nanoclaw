@@ -233,6 +233,7 @@ class MemoryConsolidator:
         context_window_tokens: int,
         build_messages: Callable[..., list[dict[str, Any]]],
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
+        proactive_ratio: float = 0.85,
     ):
         self.store = MemoryStore(workspace)
         self.provider = provider
@@ -241,6 +242,7 @@ class MemoryConsolidator:
         self.context_window_tokens = context_window_tokens
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self.proactive_ratio = proactive_ratio
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def get_lock(self, session_key: str) -> asyncio.Lock:
@@ -331,36 +333,29 @@ class MemoryConsolidator:
 
         lock = self.get_lock(session.key)
         async with lock:
-            generation = getattr(self.provider, "generation", None)
-            reserved_output = int(getattr(generation, "max_tokens", 0) or 0)
-            reserved_output = max(1, reserved_output)
-            # Keep extra headroom for estimator drift and provider-side token accounting
-            # differences to avoid boundary overflows (input + output > context window).
-            safety_margin = max(256, int(self.context_window_tokens * 0.02))
-            input_budget = max(1, self.context_window_tokens - reserved_output - safety_margin)
+            threshold = int(self.context_window_tokens * self.proactive_ratio)
 
             estimated, source = self.observed_prompt_tokens(session)
             if estimated <= 0:
                 estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
-            if estimated <= input_budget:
+            if estimated <= threshold:
                 logger.debug(
-                    "Token consolidation idle {}: {}/{} input-budget (reserved output {}, safety margin {}) via {}",
+                    "Token consolidation idle {}: {}/{} threshold (ratio {}) via {}",
                     session.key,
                     estimated,
-                    input_budget,
-                    reserved_output,
-                    safety_margin,
+                    threshold,
+                    self.proactive_ratio,
                     source,
                 )
                 return
 
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= input_budget:
+                if estimated <= threshold:
                     return
 
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - input_budget))
+                boundary = self.pick_consolidation_boundary(session, max(1, estimated - threshold))
                 if boundary is None:
                     logger.debug(
                         "Token consolidation: no safe boundary for {} (round {})",

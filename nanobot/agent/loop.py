@@ -90,6 +90,7 @@ class AgentLoop:
         vl_provider: LLMProvider | None = None,
         vl_model: str | None = None,
         routing_config: RoutingConfig | None = None,
+        memory_consolidation_ratio: float = 0.85,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -147,6 +148,7 @@ class AgentLoop:
             context_window_tokens=context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
+            proactive_ratio=memory_consolidation_ratio,
         )
         self.delegation_router = DelegationRouter(
             delegation_map=self.bus.delegation_map,
