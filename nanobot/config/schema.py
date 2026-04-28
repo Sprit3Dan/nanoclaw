@@ -58,7 +58,7 @@ class RoutingExample(Base):
     """One optional routing example for few-shot steering."""
 
     input: str = ""
-    route: Literal["primary", "vision", "secondary"] = "primary"
+    route: Literal["primary", "secondary"] = "primary"
 
 
 class RouteDescriptions(Base):
@@ -117,15 +117,11 @@ class RoutingConfig(Base):
     prompt_override: str | None = None  # Full router system prompt override
     force_primary_patterns: list[str] = Field(
         default_factory=list,
-        validation_alias=AliasChoices("force_primary_patterns", "forcePrimaryPatterns", "force_custom_patterns", "forceCustomPatterns"),
-    )
-    force_vision_patterns: list[str] = Field(
-        default_factory=list,
-        validation_alias=AliasChoices("force_vision_patterns", "forceVisionPatterns", "force_vl_patterns", "forceVlPatterns"),
+        validation_alias=AliasChoices("force_primary_patterns", "forcePrimaryPatterns"),
     )
     force_secondary_patterns: list[str] = Field(
         default_factory=list,
-        validation_alias=AliasChoices("force_secondary_patterns", "forceSecondaryPatterns", "force_reasoning_patterns", "forceReasoningPatterns"),
+        validation_alias=AliasChoices("force_secondary_patterns", "forceSecondaryPatterns"),
     )
     examples: list[RoutingExample] = Field(default_factory=list)
 

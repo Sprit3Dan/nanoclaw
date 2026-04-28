@@ -221,7 +221,8 @@ class LLMProvider(ABC):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LLMResponse(content=f"Error calling LLM: {exc}", finish_reason="error")
+            logger.debug("LLM call exception ({}): {}", type(exc).__name__, exc, exc_info=True)
+            return LLMResponse(content=f"error: {type(exc).__name__}: {exc}", finish_reason="error")
 
     async def chat_with_retry(
         self,
@@ -266,9 +267,10 @@ class LLMProvider(ABC):
                 return response
 
             logger.warning(
-                "LLM transient error (attempt {}/{}), retrying in {}s: {}",
-                attempt, len(self._CHAT_RETRY_DELAYS), delay,
-                (response.content or "")[:120].lower(),
+                "LLM transient error (attempt {}/{}) model={} api_base={}, retrying in {}s: {}",
+                attempt, len(self._CHAT_RETRY_DELAYS),
+                model or "?", self.api_base or "?", delay,
+                (response.content or "")[:300],
             )
             await asyncio.sleep(delay)
 

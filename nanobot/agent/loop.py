@@ -63,6 +63,12 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 16_000
     _ROUTER_MAX_USER_CHARS = 2_000
+    _ROUTER_WINDOW_TURNS = 3
+    _ROUTER_WINDOW_TURN_CHARS = 2_000
+    _ROUTER_SUMMARY_SYSTEM = (
+        "Summarize the following conversation in 1-2 sentences. "
+        "Focus on what topic or task was being discussed or built."
+    )
 
 
     def __init__(
@@ -548,40 +554,53 @@ class AgentLoop:
             return self._flatten_content_to_text(message.get("content"))
         return ""
 
+    def _build_turn_window(self, messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+        """Extract last N user+assistant turns before the current user message."""
+        result: list[dict[str, str]] = []
+        turns_collected = 0
+        found_current_user = False
+
+        for msg in reversed(messages):
+            role = msg.get("role")
+            if not found_current_user:
+                if role == "user":
+                    found_current_user = True
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            text = self._flatten_content_to_text(msg.get("content"))
+            result.append({"role": role, "content": (text or "(empty)")[:self._ROUTER_WINDOW_TURN_CHARS]})
+            if role == "user":
+                turns_collected += 1
+                if turns_collected >= self._ROUTER_WINDOW_TURNS:
+                    break
+
+        result.reverse()
+        return result
+
+    async def _summarize_window_with_router(self, window: list[dict[str, str]]) -> str:
+        """Use router LLM to summarize a conversation window into brief context."""
+        if not window:
+            return ""
+        conv_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in window)
+        response = await self.router_provider.chat_with_retry(
+            messages=[
+                {"role": "system", "content": self._ROUTER_SUMMARY_SYSTEM},
+                {"role": "user", "content": conv_text},
+            ],
+            model=self.router_model,
+            max_tokens=128,
+            temperature=0.0,
+        )
+        return (response.content or "").strip()
 
 
-    def _routing_primary_share(self) -> float:
-        cfg = self.routing_config
-        if cfg is None:
-            val = 0.85
-        elif hasattr(cfg, "primary_share"):
-            val = getattr(cfg, "primary_share")
-        else:
-            val = getattr(cfg, "custom_share", 0.85)
-        try:
-            f = float(val)
-        except Exception:
-            return 0.85
-        return max(0.0, min(1.0, f))
 
     def _routing_patterns(self, attr: str) -> list[str]:
         cfg = self.routing_config
         if cfg is None:
             return []
-
-        legacy_aliases: dict[str, tuple[str, ...]] = {
-            "force_primary_patterns": ("force_primary_patterns", "force_custom_patterns"),
-            "force_vision_patterns": ("force_vision_patterns", "force_vl_patterns"),
-            "force_secondary_patterns": ("force_secondary_patterns", "force_reasoning_patterns"),
-        }
-        lookup_attrs = legacy_aliases.get(attr, (attr,))
-        raw: list[str] | Any = []
-        for key in lookup_attrs:
-            value = getattr(cfg, key, None)
-            if isinstance(value, list):
-                raw = value
-                break
-
+        raw = getattr(cfg, attr, None)
         if not isinstance(raw, list):
             return []
         return [p.lower().strip() for p in raw if isinstance(p, str) and p.strip()]
@@ -589,16 +608,12 @@ class AgentLoop:
     def _routing_flag_notes(self) -> str:
         """Build optional router guidance for explicit route flags."""
         primary_flags = self._routing_patterns("force_primary_patterns")
-        vision_flags = self._routing_patterns("force_vision_patterns")
         secondary_flags = self._routing_patterns("force_secondary_patterns")
 
         lines: list[str] = []
         if primary_flags:
             joined = ", ".join(primary_flags)
             lines.append(f"- If user text includes one of [{joined}], output primary.")
-        if vision_flags:
-            joined = ", ".join(vision_flags)
-            lines.append(f"- If user text includes one of [{joined}], output vision.")
         if secondary_flags:
             joined = ", ".join(secondary_flags)
             lines.append(f"- If user text includes one of [{joined}], output secondary.")
@@ -616,34 +631,17 @@ class AgentLoop:
         primary_desc = "default choice, questions, tool calls, low level effort reasoning"
         secondary_desc = "hardcore reasoning, deep problem solving, and complex multi-step technical analysis"
 
-        route_descriptions = getattr(cfg, "route_descriptions", None) if cfg is not None else None
-        if isinstance(route_descriptions, dict):
-            primary_desc = route_descriptions.get("primary") or route_descriptions.get("custom") or primary_desc
-            secondary_desc = (
-                route_descriptions.get("secondary")
-                or route_descriptions.get("reasoning")
-                or secondary_desc
-            )
-        elif route_descriptions is not None:
-            primary_desc = (
-                getattr(route_descriptions, "primary", None)
-                or getattr(route_descriptions, "custom", None)
-                or primary_desc
-            )
-            secondary_desc = (
-                getattr(route_descriptions, "secondary", None)
-                or getattr(route_descriptions, "reasoning", None)
-                or secondary_desc
-            )
+        rd = getattr(cfg, "route_descriptions", None) if cfg is not None else None
+        if rd is not None:
+            primary_desc = getattr(rd, "primary", None) or primary_desc
+            secondary_desc = getattr(rd, "secondary", None) or secondary_desc
 
-        primary_pct = int(round(self._routing_primary_share() * 100))
-        secondary_note = f"- Route to secondary for: {secondary_desc}.\n"
         flag_note = self._routing_flag_notes()
         return (
             "You are a routing classifier for an AI assistant.\n"
             "Output exactly one label: primary or secondary.\n"
-            f"- Route to primary for: {primary_desc}. This should be the dominant route (~{primary_pct}%).\n"
-            f"{secondary_note}"
+            f"- Route to primary for: {primary_desc}.\n"
+            f"- Route to secondary for: {secondary_desc}.\n"
             f"{flag_note}"
             "Do not explain. Return one label only."
         )
@@ -664,7 +662,7 @@ class AgentLoop:
             if not isinstance(user_in, str) or not user_in.strip():
                 continue
             normalized = self._parse_router_route(route)
-            if normalized not in ("primary", "vision", "secondary"):
+            if normalized not in ("primary", "secondary"):
                 continue
             result.append((user_in.strip(), normalized))
         return result
@@ -692,9 +690,9 @@ class AgentLoop:
         if route == "primary":
             key = getattr(cfg, "primary_provider", None)
         elif route == "vision":
-            key = getattr(cfg, "vision_provider", None) or getattr(cfg, "vl_provider", None)
+            key = getattr(cfg, "vision_provider", None)
         else:
-            key = getattr(cfg, "secondary_provider", None) or getattr(cfg, "reasoning_provider", None)
+            key = getattr(cfg, "secondary_provider", None)
 
         if isinstance(key, str) and key.strip():
             return key.strip()
@@ -709,15 +707,11 @@ class AgentLoop:
         if route == "vision":
             provider = self.vl_provider or self.vision_provider or self.provider
             model = self.vl_model or self.vision_model or self.model
-            cfg_model = (
-                getattr(cfg, "vision_model", None) if cfg is not None else None
-            ) or (getattr(cfg, "vl_model", None) if cfg is not None else None)
+            cfg_model = getattr(cfg, "vision_model", None) if cfg is not None else None
         elif route == "secondary":
             provider = self.reasoning_provider or self.provider
             model = self.reasoning_model or self.model
-            cfg_model = (
-                getattr(cfg, "secondary_model", None) if cfg is not None else None
-            ) or (getattr(cfg, "reasoning_model", None) if cfg is not None else None)
+            cfg_model = getattr(cfg, "secondary_model", None) if cfg is not None else None
         else:
             provider = self.provider
             model = self.model
@@ -729,12 +723,10 @@ class AgentLoop:
         return provider, model, self._routing_provider_key(route)
 
     @staticmethod
-    def _parse_router_route(content: str | None) -> Literal["primary", "vision", "secondary"]:
+    def _parse_router_route(content: str | None) -> Literal["primary", "secondary"]:
         """Parse route label from router LLM output."""
         text = (content or "").strip().lower()
-        if "vision" in text or "custom_vl" in text or "customvl" in text:
-            return "vision"
-        if "secondary" in text or "reasoning" in text or "fallback" in text or "sota" in text:
+        if "secondary" in text or "reasoning" in text:
             return "secondary"
         return "primary"
 
@@ -743,9 +735,14 @@ class AgentLoop:
         messages: list[dict[str, Any]],
     ) -> Literal["primary", "vision", "secondary"]:
         """Use a tiny router model to classify the request path."""
+        window = self._build_turn_window(messages)
+        summary = await self._summarize_window_with_router(window)
+
         user_text = self._extract_latest_user_text(messages)
         if len(user_text) > self._ROUTER_MAX_USER_CHARS:
             user_text = user_text[:self._ROUTER_MAX_USER_CHARS]
+
+        context = f"Context: {summary}\n\nRequest: {user_text}" if summary else user_text
 
         router_messages: list[dict[str, str]] = [
             {"role": "system", "content": self._routing_prompt()},
@@ -753,7 +750,7 @@ class AgentLoop:
         for ex_input, ex_route in self._routing_examples():
             router_messages.append({"role": "user", "content": ex_input})
             router_messages.append({"role": "assistant", "content": ex_route})
-        router_messages.append({"role": "user", "content": user_text or "(empty user request)"})
+        router_messages.append({"role": "user", "content": context or "(empty user request)"})
 
         response = await self.router_provider.chat_with_retry(
             messages=router_messages,
@@ -762,18 +759,38 @@ class AgentLoop:
             temperature=0.0,
         )
         route = self._parse_router_route(response.content)
+        logger.debug("Router → {} | summary: {}", route, summary or "(none)")
         return route
+
+    @staticmethod
+    def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+        """Return True if the latest user message contains image_url blocks."""
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                return any(
+                    isinstance(b, dict) and b.get("type") == "image_url"
+                    for b in content
+                )
+            return False
+        return False
 
     async def _select_provider_for_request(
         self,
         messages: list[dict[str, Any]],
     ) -> tuple[LLMProvider, str, str]:
-        """Route a request solely via router LLM, then map to configured route target."""
+        """Route a request to the appropriate provider."""
+        if self._messages_have_images(messages) and self._is_route_available(
+            self.vl_provider or self.vision_provider, self.vl_model or self.vision_model
+        ):
+            return self._route_target("vision")
+
         default_provider, default_model, default_label = self._route_target("primary")
         if not self._is_route_available(self.router_provider, self.router_model):
             return default_provider, default_model, default_label
 
-        route: Literal["primary", "vision", "secondary"] = "primary"
         try:
             route = await self._route_with_router_llm(messages)
         except Exception as e:
@@ -1037,7 +1054,11 @@ class AgentLoop:
             channel=tool_channel, chat_id=tool_chat_id,
             metadata=msg_meta,
         )
-        initial_messages = self._strip_images_for_text_model(initial_messages)
+        vl_available = self._is_route_available(
+            self.vl_provider or self.vision_provider, self.vl_model or self.vision_model
+        )
+        if not (self._messages_have_images(initial_messages) and vl_available):
+            initial_messages = self._strip_images_for_text_model(initial_messages)
 
         vision_updates = getattr(self, "_vision_context_updates", {})
         vision_updates.clear()

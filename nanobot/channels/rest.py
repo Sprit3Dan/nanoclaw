@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,6 +16,15 @@ from loguru import logger
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.schema import Base
+
+class RestChannelConfig(Base):
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8765
+    allow_from: list[str] = []
+    timeout: float = 3600.0
+
 
 _STATUS_TEXT = {
     200: "OK",
@@ -24,12 +36,20 @@ _STATUS_TEXT = {
 }
 
 
+@dataclass
+class _PendingResponse:
+    future: asyncio.Future[str]
+    files: list[str] = field(default_factory=list)  # download URLs registered during this turn
+
+
 class RestChannel(BaseChannel):
     """
     HTTP channel for synchronous request/response messaging.
 
-    POST /chat  {"message": "...", "session_id": "..."}  → {"response": "...", "session_id": "..."}
-    GET  /health                                          → {"ok": true}
+    POST /chat          {"message": "...", "session_id": "..."}
+                        → {"response": "...", "session_id": "...", "files": ["http://.../files/<token>"]}
+    GET  /files/<token> → raw file bytes (served once; token expires after download)
+    GET  /health        → {"ok": true}
 
     Auth: X-API-Key header matched against allow_from list. Use ["*"] for open access.
     """
@@ -38,9 +58,13 @@ class RestChannel(BaseChannel):
     display_name = "REST"
 
     def __init__(self, config: Any, bus: MessageBus) -> None:
+        if isinstance(config, dict):
+            config = RestChannelConfig.model_validate(config)
         super().__init__(config, bus)
+        self.config: RestChannelConfig = config
         self._server: asyncio.base_events.Server | None = None
-        self._pending: dict[str, asyncio.Future[str]] = {}
+        self._pending: dict[str, _PendingResponse] = {}
+        self._file_tokens: dict[str, Path] = {}  # token → absolute path
 
     async def start(self) -> None:
         self._running = True
@@ -57,17 +81,32 @@ class RestChannel(BaseChannel):
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.cancel()
+        for pr in self._pending.values():
+            if not pr.future.done():
+                pr.future.cancel()
         self._pending.clear()
+        self._file_tokens.clear()
 
     async def send(self, msg: OutboundMessage) -> None:
-        future = self._pending.get(msg.chat_id)
-        if future and not future.done():
-            future.set_result(msg.content)
+        pr = self._pending.get(msg.chat_id)
+        if not pr or pr.future.done():
+            return
 
-    # ── connection handler ───────────────────────────────────────────────���─────
+        host = str(getattr(self.config, "host", "0.0.0.0"))
+        port = int(getattr(self.config, "port", 8765))
+        base = f"http://{host}:{port}"
+
+        for media_path in msg.media or []:
+            path = Path(media_path)
+            if path.is_file():
+                token = uuid.uuid4().hex
+                self._file_tokens[token] = path.resolve()
+                pr.files.append(f"{base}/files/{token}")
+                logger.debug("REST: registered file token {} → {}", token, path)
+
+        pr.future.set_result(msg.content)
+
+    # ── connection handler ────────────────────────────────────────────────────
 
     async def _handle_connection(
         self,
@@ -84,6 +123,11 @@ class RestChannel(BaseChannel):
 
             if method == "POST" and path == "/chat":
                 await self._route_chat(writer, headers, body)
+                return
+
+            if method == "GET" and path.startswith("/files/"):
+                token = path[len("/files/"):]
+                await self._route_file(writer, token)
                 return
 
             if method == "GET" and path == "/health":
@@ -129,7 +173,8 @@ class RestChannel(BaseChannel):
         session_id = str(payload.get("session_id") or uuid.uuid4())
 
         future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
-        self._pending[session_id] = future
+        pr = _PendingResponse(future=future)
+        self._pending[session_id] = pr
 
         try:
             await self.bus.publish_inbound(InboundMessage(
@@ -141,7 +186,11 @@ class RestChannel(BaseChannel):
             ))
             timeout = float(getattr(self.config, "timeout", 120.0))
             response = await asyncio.wait_for(future, timeout=timeout)
-            await self._write_json(writer, 200, {"response": response, "session_id": session_id})
+            await self._write_json(writer, 200, {
+                "response": response,
+                "session_id": session_id,
+                "files": pr.files,
+            })
         except asyncio.TimeoutError:
             await self._write_json(writer, 408, {"error": "timeout"})
         except asyncio.CancelledError:
@@ -149,7 +198,32 @@ class RestChannel(BaseChannel):
         finally:
             self._pending.pop(session_id, None)
 
-    # ── HTTP primitives ────────────────────────────────────────────────────────
+    async def _route_file(self, writer: asyncio.StreamWriter, token: str) -> None:
+        path = self._file_tokens.pop(token, None)
+        if path is None or not path.is_file():
+            await self._write_json(writer, 404, {"error": "file not found or already downloaded"})
+            return
+
+        try:
+            data = path.read_bytes()
+        except Exception as e:
+            await self._write_json(writer, 500, {"error": f"read error: {e}"})
+            return
+
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        writer.write(
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: {mime}\r\n"
+            f"Content-Length: {len(data)}\r\n"
+            f"Content-Disposition: attachment; filename=\"{path.name}\"\r\n"
+            f"Connection: close\r\n"
+            f"\r\n".encode("utf-8")
+        )
+        writer.write(data)
+        await writer.drain()
+        logger.debug("REST: served file {} ({})", path.name, token)
+
+    # ── HTTP primitives ───────────────────────────────────────────────────────
 
     async def _read_request(
         self,
