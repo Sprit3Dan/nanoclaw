@@ -69,6 +69,12 @@ class AgentLoop:
         "Summarize the following conversation in 1-2 sentences. "
         "Focus on what topic or task was being discussed or built."
     )
+    _ROUTER_SUMMARY_UPDATE_SYSTEM = (
+        "You maintain a compact running summary of an AI agent session for routing purposes. "
+        "Given the previous summary and the latest exchange, output an updated summary in 1-2 short sentences. "
+        "Keep the original goal visible. Note persistent failures or blockers. Drop implementation details. "
+        "Never grow longer than 2 sentences regardless of input length."
+    )
 
 
     def __init__(
@@ -401,12 +407,21 @@ class AgentLoop:
         }
         consecutive_message_only_tool_rounds = 0
         max_consecutive_message_only_tool_rounds = 3
-
-        active_provider, active_model, route_label = await self._select_provider_for_request(messages)
-        logger.info("Request route selected: {}", route_label)
+        running_summary: str = ""
 
         while iteration < self.max_iterations:
             iteration += 1
+
+            active_provider, active_model, route_label = await self._select_provider_for_request(
+                messages, running_summary=running_summary
+            )
+            logger.info(
+                "Route iter={} model={} route={} summary={}",
+                iteration,
+                active_model,
+                route_label,
+                f'"{running_summary}"' if running_summary else "(none)",
+            )
 
             tool_defs = self.tools.get_definitions()
 
@@ -494,14 +509,25 @@ class AgentLoop:
                 ]
                 end_turn_after_message = any(tc.name == "message" for tc in ordered_tool_calls)
 
+                collected_tool_results: list[tuple[str, str]] = []
                 for tool_call in ordered_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    collected_tool_results.append((tool_call.name, str(result)))
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
+                if self._is_route_available(self.router_provider, self.router_model):
+                    running_summary = await self._update_running_summary(
+                        running_summary,
+                        assistant_content=response.content,
+                        tool_calls=tool_call_dicts,
+                        tool_results=collected_tool_results,
+                    )
+                    logger.info("Routing summary updated iter={}: {}", iteration, f'"{running_summary}"')
 
                 if end_turn_after_message:
                     break
@@ -593,6 +619,55 @@ class AgentLoop:
             temperature=0.0,
         )
         return (response.content or "").strip()
+
+    @staticmethod
+    def _tool_result_signal(name: str, result: str) -> str:
+        """Extract a brief signal from a tool result: tool name + ok/error indicator."""
+        lowered = result.lower()
+        if any(w in lowered for w in ("error", "exception", "traceback", "failed", "invalid", "cannot", "no such")):
+            snippet = result.strip()[:120].replace("\n", " ")
+            return f"{name}: error — {snippet}"
+        return f"{name}: ok"
+
+    async def _update_running_summary(
+        self,
+        prev_summary: str,
+        assistant_content: str | None,
+        tool_calls: list[dict[str, Any]] | None,
+        tool_results: list[tuple[str, str]] | None,
+    ) -> str:
+        """Incrementally update running summary with the latest exchange."""
+        parts: list[str] = []
+
+        if assistant_content and assistant_content.strip():
+            parts.append(f"REASONING: {assistant_content.strip()[:400]}")
+
+        if tool_results:
+            signals = [self._tool_result_signal(name, result) for name, result in tool_results[:8]]
+            parts.append("TOOLS: " + " | ".join(signals))
+
+        if not parts:
+            return prev_summary
+
+        exchange = "\n".join(parts)
+        user_content = (
+            f"Previous summary: {prev_summary}\n\nLatest exchange:\n{exchange}"
+            if prev_summary
+            else f"Latest exchange:\n{exchange}"
+        )
+        try:
+            response = await self.router_provider.chat_with_retry(
+                messages=[
+                    {"role": "system", "content": self._ROUTER_SUMMARY_UPDATE_SYSTEM},
+                    {"role": "user", "content": user_content},
+                ],
+                model=self.router_model,
+                temperature=0.0,
+            )
+            return (response.content or "").strip() or prev_summary
+        except Exception as e:
+            logger.debug("Running summary update failed: {}", e)
+            return prev_summary
 
 
 
@@ -733,10 +808,14 @@ class AgentLoop:
     async def _route_with_router_llm(
         self,
         messages: list[dict[str, Any]],
+        running_summary: str = "",
     ) -> Literal["primary", "vision", "secondary"]:
         """Use a tiny router model to classify the request path."""
-        window = self._build_turn_window(messages)
-        summary = await self._summarize_window_with_router(window)
+        if running_summary:
+            summary = running_summary
+        else:
+            window = self._build_turn_window(messages)
+            summary = await self._summarize_window_with_router(window)
 
         user_text = self._extract_latest_user_text(messages)
         if len(user_text) > self._ROUTER_MAX_USER_CHARS:
@@ -780,6 +859,7 @@ class AgentLoop:
     async def _select_provider_for_request(
         self,
         messages: list[dict[str, Any]],
+        running_summary: str = "",
     ) -> tuple[LLMProvider, str, str]:
         """Route a request to the appropriate provider."""
         if self._messages_have_images(messages) and self._is_route_available(
@@ -792,7 +872,7 @@ class AgentLoop:
             return default_provider, default_model, default_label
 
         try:
-            route = await self._route_with_router_llm(messages)
+            route = await self._route_with_router_llm(messages, running_summary=running_summary)
         except Exception as e:
             logger.warning("Router model failed, defaulting to primary route: {}", e)
             return default_provider, default_model, default_label
