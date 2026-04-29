@@ -168,6 +168,14 @@ class _LoopHook(AgentHook):
             u.get("cached_tokens", 0),
         )
 
+        # --- FIX GOES HERE ---
+        # If the outbound message tool was just called, kill the stream callbacks.
+        # This prevents the LLM from streaming its redundant conversational wrap-up
+        # to the chat while the orchestrator waits for the turn to finish.
+        if context.tool_calls and any(tc.name == "message" for tc in context.tool_calls):
+            self._on_stream = None
+            self._on_stream_end = None
+
     def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
         return self._loop._strip_think(content)
 
