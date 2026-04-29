@@ -421,6 +421,7 @@ class AgentLoop:
             self.tools.register(ConsultTool(
                 provider=self._secondary_provider,
                 model=self._secondary_model or self._secondary_provider.get_default_model(),
+                memory_store=self.context.memory
             ))
         if self._vision_provider:
             self.tools.register(VisionAnalyzeTool(
