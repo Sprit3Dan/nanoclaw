@@ -62,19 +62,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
-    _ROUTER_MAX_USER_CHARS = 2_000
-    _ROUTER_WINDOW_TURNS = 3
-    _ROUTER_WINDOW_TURN_CHARS = 2_000
-    _ROUTER_SUMMARY_SYSTEM = (
-        "Summarize the following conversation in 1-2 sentences. "
-        "Focus on what topic or task was being discussed or built."
-    )
-    _ROUTER_SUMMARY_UPDATE_SYSTEM = (
-        "You maintain a compact running summary of an AI agent session for routing purposes. "
-        "Given the previous summary and the latest exchange, output an updated summary in 1-2 short sentences. "
-        "Keep the original goal visible. Note persistent failures or blockers. Drop implementation details. "
-        "Never grow longer than 2 sentences regardless of input length."
-    )
+
 
 
     def __init__(
@@ -95,8 +83,6 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         vision_provider: LLMProvider | None = None,
         vision_model: str | None = None,
-        router_provider: LLMProvider | None = None,
-        router_model: str | None = None,
         reasoning_provider: LLMProvider | None = None,
         reasoning_model: str | None = None,
         vl_provider: LLMProvider | None = None,
@@ -122,8 +108,6 @@ class AgentLoop:
         self._last_usage: dict[str, int] = {}
         self.vision_provider = vision_provider or provider
         self.vision_model = vision_model or self.model
-        self.router_provider = router_provider or provider
-        self.router_model = router_model or self.model
         self.reasoning_provider = reasoning_provider or provider
         self.reasoning_model = reasoning_model or self.model
         self.vl_provider = vl_provider or self.vision_provider
@@ -200,6 +184,12 @@ class AgentLoop:
             self._vision_context_updates: dict[str, str] = {}
             self.tools.register(VisionAnalyzeTool(
                 self.vl_provider, self.vl_model, self._vision_context_updates,
+            ))
+        if self.reasoning_provider is not self.provider or self.reasoning_model != self.model:
+            from nanobot.agent.tools.consult import ConsultTool
+            self.tools.register(ConsultTool(
+                provider=self.reasoning_provider,
+                model=self.reasoning_model,
             ))
 
     async def _connect_mcp(self) -> None:
@@ -407,21 +397,11 @@ class AgentLoop:
         }
         consecutive_message_only_tool_rounds = 0
         max_consecutive_message_only_tool_rounds = 3
-        running_summary: str = ""
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            active_provider, active_model, route_label = await self._select_provider_for_request(
-                messages, running_summary=running_summary
-            )
-            logger.info(
-                "Route iter={} model={} route={} summary={}",
-                iteration,
-                active_model,
-                route_label,
-                f'"{running_summary}"' if running_summary else "(none)",
-            )
+            active_provider, active_model, route_label = self._select_provider_for_request(messages)
 
             tool_defs = self.tools.get_definitions()
 
@@ -509,25 +489,14 @@ class AgentLoop:
                 ]
                 end_turn_after_message = any(tc.name == "message" for tc in ordered_tool_calls)
 
-                collected_tool_results: list[tuple[str, str]] = []
                 for tool_call in ordered_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    collected_tool_results.append((tool_call.name, str(result)))
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
-
-                if self._is_route_available(self.router_provider, self.router_model):
-                    running_summary = await self._update_running_summary(
-                        running_summary,
-                        assistant_content=response.content,
-                        tool_calls=tool_call_dicts,
-                        tool_results=collected_tool_results,
-                    )
-                    logger.info("Routing summary updated iter={}: {}", iteration, f'"{running_summary}"')
 
                 if end_turn_after_message:
                     break
@@ -554,195 +523,6 @@ class AgentLoop:
             )
         self._last_usage = turn_usage_max
         return final_content, tools_used, messages
-
-    @staticmethod
-    def _flatten_content_to_text(content: Any) -> str:
-        """Flatten message content (string/list blocks) into plain text."""
-        if isinstance(content, str):
-            return content
-        if not isinstance(content, list):
-            return ""
-        chunks: list[str] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                chunks.append(block["text"])
-        return "\n".join(chunks).strip()
-
-
-
-    def _extract_latest_user_text(self, messages: list[dict[str, Any]]) -> str:
-        """Get the latest user message as plain text."""
-        for message in reversed(messages):
-            if message.get("role") != "user":
-                continue
-            return self._flatten_content_to_text(message.get("content"))
-        return ""
-
-    def _build_turn_window(self, messages: list[dict[str, Any]]) -> list[dict[str, str]]:
-        """Extract last N user+assistant turns before the current user message."""
-        result: list[dict[str, str]] = []
-        turns_collected = 0
-        found_current_user = False
-
-        for msg in reversed(messages):
-            role = msg.get("role")
-            if not found_current_user:
-                if role == "user":
-                    found_current_user = True
-                continue
-            if role not in ("user", "assistant"):
-                continue
-            text = self._flatten_content_to_text(msg.get("content"))
-            result.append({"role": role, "content": (text or "(empty)")[:self._ROUTER_WINDOW_TURN_CHARS]})
-            if role == "user":
-                turns_collected += 1
-                if turns_collected >= self._ROUTER_WINDOW_TURNS:
-                    break
-
-        result.reverse()
-        return result
-
-    async def _summarize_window_with_router(self, window: list[dict[str, str]]) -> str:
-        """Use router LLM to summarize a conversation window into brief context."""
-        if not window:
-            return ""
-        conv_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in window)
-        response = await self.router_provider.chat_with_retry(
-            messages=[
-                {"role": "system", "content": self._ROUTER_SUMMARY_SYSTEM},
-                {"role": "user", "content": conv_text},
-            ],
-            model=self.router_model,
-            max_tokens=128,
-            temperature=0.0,
-        )
-        return (response.content or "").strip()
-
-    @staticmethod
-    def _tool_result_signal(name: str, result: str) -> str:
-        """Extract a brief signal from a tool result: tool name + ok/error indicator."""
-        lowered = result.lower()
-        if any(w in lowered for w in ("error", "exception", "traceback", "failed", "invalid", "cannot", "no such")):
-            snippet = result.strip()[:120].replace("\n", " ")
-            return f"{name}: error — {snippet}"
-        return f"{name}: ok"
-
-    async def _update_running_summary(
-        self,
-        prev_summary: str,
-        assistant_content: str | None,
-        tool_calls: list[dict[str, Any]] | None,
-        tool_results: list[tuple[str, str]] | None,
-    ) -> str:
-        """Incrementally update running summary with the latest exchange."""
-        parts: list[str] = []
-
-        if assistant_content and assistant_content.strip():
-            parts.append(f"REASONING: {assistant_content.strip()[:400]}")
-
-        if tool_results:
-            signals = [self._tool_result_signal(name, result) for name, result in tool_results[:8]]
-            parts.append("TOOLS: " + " | ".join(signals))
-
-        if not parts:
-            return prev_summary
-
-        exchange = "\n".join(parts)
-        user_content = (
-            f"Previous summary: {prev_summary}\n\nLatest exchange:\n{exchange}"
-            if prev_summary
-            else f"Latest exchange:\n{exchange}"
-        )
-        try:
-            response = await self.router_provider.chat_with_retry(
-                messages=[
-                    {"role": "system", "content": self._ROUTER_SUMMARY_UPDATE_SYSTEM},
-                    {"role": "user", "content": user_content},
-                ],
-                model=self.router_model,
-                temperature=0.0,
-            )
-            return (response.content or "").strip() or prev_summary
-        except Exception as e:
-            logger.debug("Running summary update failed: {}", e)
-            return prev_summary
-
-
-
-    def _routing_patterns(self, attr: str) -> list[str]:
-        cfg = self.routing_config
-        if cfg is None:
-            return []
-        raw = getattr(cfg, attr, None)
-        if not isinstance(raw, list):
-            return []
-        return [p.lower().strip() for p in raw if isinstance(p, str) and p.strip()]
-
-    def _routing_flag_notes(self) -> str:
-        """Build optional router guidance for explicit route flags."""
-        primary_flags = self._routing_patterns("force_primary_patterns")
-        secondary_flags = self._routing_patterns("force_secondary_patterns")
-
-        lines: list[str] = []
-        if primary_flags:
-            joined = ", ".join(primary_flags)
-            lines.append(f"- If user text includes one of [{joined}], output primary.")
-        if secondary_flags:
-            joined = ", ".join(secondary_flags)
-            lines.append(f"- If user text includes one of [{joined}], output secondary.")
-
-        if not lines:
-            return ""
-        return "Flag overrides:\n" + "\n".join(lines) + "\n"
-
-    def _routing_prompt(self) -> str:
-        cfg = self.routing_config
-        override = getattr(cfg, "prompt_override", None) if cfg is not None else None
-        if isinstance(override, str) and override.strip():
-            return override.strip()
-
-        primary_desc = "default choice, questions, tool calls, low level effort reasoning"
-        secondary_desc = "hardcore reasoning, deep problem solving, and complex multi-step technical analysis"
-
-        rd = getattr(cfg, "route_descriptions", None) if cfg is not None else None
-        if rd is not None:
-            primary_desc = getattr(rd, "primary", None) or primary_desc
-            secondary_desc = getattr(rd, "secondary", None) or secondary_desc
-
-        flag_note = self._routing_flag_notes()
-        return (
-            "You are a routing classifier for an AI assistant.\n"
-            "Output exactly one label: primary or secondary.\n"
-            f"- Route to primary for: {primary_desc}.\n"
-            f"- Route to secondary for: {secondary_desc}.\n"
-            f"{flag_note}"
-            "Do not explain. Return one label only."
-        )
-
-    def _routing_examples(self) -> list[tuple[str, str]]:
-        cfg = self.routing_config
-        raw = getattr(cfg, "examples", []) if cfg is not None else []
-        if not isinstance(raw, list):
-            return []
-        result: list[tuple[str, str]] = []
-        for item in raw:
-            if isinstance(item, dict):
-                user_in = item.get("input")
-                route = item.get("route")
-            else:
-                user_in = getattr(item, "input", None)
-                route = getattr(item, "route", None)
-            if not isinstance(user_in, str) or not user_in.strip():
-                continue
-            normalized = self._parse_router_route(route)
-            if normalized not in ("primary", "secondary"):
-                continue
-            result.append((user_in.strip(), normalized))
-        return result
-
-
 
     @staticmethod
     def _is_route_available(provider: LLMProvider | None, model: str | None) -> bool:
@@ -798,50 +578,6 @@ class AgentLoop:
         return provider, model, self._routing_provider_key(route)
 
     @staticmethod
-    def _parse_router_route(content: str | None) -> Literal["primary", "secondary"]:
-        """Parse route label from router LLM output."""
-        text = (content or "").strip().lower()
-        if "secondary" in text or "reasoning" in text:
-            return "secondary"
-        return "primary"
-
-    async def _route_with_router_llm(
-        self,
-        messages: list[dict[str, Any]],
-        running_summary: str = "",
-    ) -> Literal["primary", "vision", "secondary"]:
-        """Use a tiny router model to classify the request path."""
-        if running_summary:
-            summary = running_summary
-        else:
-            window = self._build_turn_window(messages)
-            summary = await self._summarize_window_with_router(window)
-
-        user_text = self._extract_latest_user_text(messages)
-        if len(user_text) > self._ROUTER_MAX_USER_CHARS:
-            user_text = user_text[:self._ROUTER_MAX_USER_CHARS]
-
-        context = f"Context: {summary}\n\nRequest: {user_text}" if summary else user_text
-
-        router_messages: list[dict[str, str]] = [
-            {"role": "system", "content": self._routing_prompt()},
-        ]
-        for ex_input, ex_route in self._routing_examples():
-            router_messages.append({"role": "user", "content": ex_input})
-            router_messages.append({"role": "assistant", "content": ex_route})
-        router_messages.append({"role": "user", "content": context or "(empty user request)"})
-
-        response = await self.router_provider.chat_with_retry(
-            messages=router_messages,
-            model=self.router_model,
-            max_tokens=8,
-            temperature=0.0,
-        )
-        route = self._parse_router_route(response.content)
-        logger.debug("Router → {} | summary: {}", route, summary or "(none)")
-        return route
-
-    @staticmethod
     def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
         """Return True if the latest user message contains image_url blocks."""
         for msg in reversed(messages):
@@ -856,30 +592,16 @@ class AgentLoop:
             return False
         return False
 
-    async def _select_provider_for_request(
+    def _select_provider_for_request(
         self,
         messages: list[dict[str, Any]],
-        running_summary: str = "",
     ) -> tuple[LLMProvider, str, str]:
-        """Route a request to the appropriate provider."""
+        """Route a request to the appropriate provider (vision or primary)."""
         if self._messages_have_images(messages) and self._is_route_available(
             self.vl_provider or self.vision_provider, self.vl_model or self.vision_model
         ):
             return self._route_target("vision")
-
-        default_provider, default_model, default_label = self._route_target("primary")
-        if not self._is_route_available(self.router_provider, self.router_model):
-            return default_provider, default_model, default_label
-
-        try:
-            route = await self._route_with_router_llm(messages, running_summary=running_summary)
-        except Exception as e:
-            logger.warning("Router model failed, defaulting to primary route: {}", e)
-            return default_provider, default_model, default_label
-
-        if route == "secondary" and self._is_route_available(self.reasoning_provider, self.reasoning_model):
-            return self._route_target("secondary")
-        return default_provider, default_model, default_label
+        return self._route_target("primary")
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""

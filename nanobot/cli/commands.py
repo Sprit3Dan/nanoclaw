@@ -553,44 +553,6 @@ def _make_primary_provider(config: Config):
     )
 
 
-def _make_router_provider(config: Config):
-    """Create the tiny router provider/model for request classification."""
-    router_model = _routing_value(
-        config,
-        "router_model",
-        "reasoning_router_model",
-        default=config.get_reasoning_router_model(),
-    )
-    router_provider = _routing_value(
-        config,
-        "router_provider",
-        "reasoning_router_provider",
-        default=config.agents.defaults.reasoning_router_provider,
-    )
-
-    # Explicit router config always wins.
-    if router_provider or router_model:
-        forced_provider = None if router_provider in (None, "", "auto") else str(router_provider)
-        return _make_provider(
-            config,
-            model=router_model or config.agents.defaults.model,
-            forced_provider=forced_provider,
-        )
-
-    # If a dedicated custom router endpoint is configured, use it by default.
-    router_cfg = config.providers.custom_router
-    has_custom_router = bool(router_cfg.api_key or router_cfg.api_base or router_cfg.extra_headers)
-    if has_custom_router:
-        return _make_provider(
-            config,
-            model=config.agents.defaults.model,
-            forced_provider="custom_router",
-        )
-
-    # Fallback to the configured primary route provider/model.
-    return _make_primary_provider(config)
-
-
 def _make_secondary_provider(config: Config):
     """Create the optional secondary-route provider/model."""
     secondary_model = _routing_value(
@@ -736,7 +698,6 @@ def gateway(
     bus = MessageBus()
     provider = _make_primary_provider(runtime_config)
     vision_provider = _make_vision_provider(runtime_config)
-    router_provider = _make_router_provider(runtime_config)
     secondary_provider = _make_secondary_provider(runtime_config)
     vision_route_provider = _make_vl_provider(runtime_config)
     session_manager = SessionManager(runtime_config.workspace_path)
@@ -750,13 +711,11 @@ def gateway(
         bus=bus,
         provider=provider,
         vision_provider=vision_provider,
-        router_provider=router_provider,
         reasoning_provider=secondary_provider,
         vl_provider=vision_route_provider,
         workspace=runtime_config.workspace_path,
         model=provider.get_default_model(),
         vision_model=runtime_config.get_vision_model(),
-        router_model=router_provider.get_default_model(),
         reasoning_model=secondary_provider.get_default_model(),
         vl_model=vision_route_provider.get_default_model(),
         routing_config=runtime_config.routing,
@@ -987,7 +946,6 @@ def agent(
     bus = MessageBus()
     provider = _make_primary_provider(runtime_config)
     vision_provider = _make_vision_provider(runtime_config)
-    router_provider = _make_router_provider(runtime_config)
     secondary_provider = _make_secondary_provider(runtime_config)
     vision_route_provider = _make_vl_provider(runtime_config)
 
@@ -1004,13 +962,11 @@ def agent(
         bus=bus,
         provider=provider,
         vision_provider=vision_provider,
-        router_provider=router_provider,
         reasoning_provider=secondary_provider,
         vl_provider=vision_route_provider,
         workspace=runtime_config.workspace_path,
         model=provider.get_default_model(),
         vision_model=runtime_config.get_vision_model(),
-        router_model=router_provider.get_default_model(),
         reasoning_model=secondary_provider.get_default_model(),
         vl_model=vision_route_provider.get_default_model(),
         routing_config=runtime_config.routing,
