@@ -103,10 +103,9 @@ class MessageTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Send a message to the user, optionally with file attachments. "
-            "This is the ONLY way to deliver files (images, documents, audio, video) to the user. "
-            "Use the 'media' parameter with file paths to attach files. "
-            "Do NOT use read_file to send files — that only reads content for your own analysis."
+            "Send a message to the user... "
+            "Use RAW absolute file paths in 'media' (e.g., '/app/image.png'). "
+            "Do NOT use 'file://' prefixes, as they will cause path resolution errors."
         )
 
     async def execute(
