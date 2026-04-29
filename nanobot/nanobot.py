@@ -9,6 +9,9 @@ from typing import Any
 from nanobot.agent.hook import AgentHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
+from nanobot.config.loader import load_config, resolve_config_env_vars
+from nanobot.config.schema import Config
+from nanobot.providers.factory import make_secondary_provider, make_vision_provider
 
 
 @dataclass(slots=True)
@@ -47,8 +50,6 @@ class Nanobot:
                 ``~/.nanobot/config.json``.
             workspace: Override the workspace directory from config.
         """
-        from nanobot.config.loader import load_config, resolve_config_env_vars
-        from nanobot.config.schema import Config
 
         resolved: Path | None = None
         if config_path is not None:
@@ -63,6 +64,8 @@ class Nanobot:
             )
 
         provider = _make_provider(config)
+        secondary_provider, secondary_model = make_secondary_provider(config)
+        vision_provider, vision_model = make_vision_provider(config)
         bus = MessageBus()
         defaults = config.agents.defaults
 
@@ -86,6 +89,10 @@ class Nanobot:
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             tools_config=config.tools,
+            secondary_provider=secondary_provider,
+            secondary_model=secondary_model,
+            vision_provider=vision_provider,
+            vision_model=vision_model,
         )
         return cls(loop)
 
